@@ -1,0 +1,12 @@
+.venv
+__pycache__
+*.pyc
+.git
+.vscode
+chroma_db
+data
+logs
+uploads
+models
+env
+*.log

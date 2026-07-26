@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>企业知识库 - RAG 聊天</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, "Microsoft YaHei", sans-serif; background: #1a1a2e; color: #eee; height: 100vh; display: flex; }
+/* 侧边栏 */
+.sidebar { width: 280px; background: #16213e; padding: 20px; display: flex; flex-direction: column; gap: 15px; }
+.sidebar h2 { font-size: 16px; color: #888; text-transform: uppercase; letter-spacing: 2px; }
+.sidebar input, .sidebar select { padding: 10px; background: #0f3460; border: 1px solid #1a508b; color: #eee; border-radius: 6px; font-size: 14px; }
+.sidebar button { padding: 10px; background: #e94560; border: none; color: white; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: bold; }
+.sidebar button:hover { background: #c73e54; }
+/* 聊天区 */
+.main { flex: 1; display: flex; flex-direction: column; max-width: 800px; margin: 0 auto; }
+.header { padding: 20px; border-bottom: 1px solid #2a2a4a; font-size: 13px; color: #888; }
+.messages { flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 16px; }
+.msg { max-width: 85%; padding: 14px 18px; border-radius: 12px; line-height: 1.7; font-size: 15px; white-space: pre-wrap; word-break: break-word; }
+.msg.user { align-self: flex-end; background: #e94560; color: #fff; }
+.msg.assistant { align-self: flex-start; background: #16213e; border: 1px solid #2a2a4a; }
+.msg.assistant .sources { margin-top: 12px; padding-top: 10px; border-top: 1px solid #333; font-size: 12px; color: #888; }
+.msg.assistant .sources span { display: inline-block; background: #0f3460; padding: 2px 8px; border-radius: 4px; margin: 2px; }
+.input-area { padding: 20px; border-top: 1px solid #2a2a4a; display: flex; gap: 10px; }
+.input-area input { flex: 1; padding: 12px 16px; background: #16213e; border: 1px solid #2a2a4a; color: #eee; border-radius: 8px; font-size: 15px; outline: none; }
+.input-area input:focus { border-color: #e94560; }
+.input-area button { padding: 12px 24px; background: #e94560; border: none; color: white; border-radius: 8px; cursor: pointer; font-size: 15px; font-weight: bold; }
+.input-area button:hover { background: #c73e54; }
+.input-area button:disabled { background: #555; cursor: not-allowed; }
+.loading { color: #e94560; font-size: 13px; padding: 8px 0; }
+</style>
+</head>
+<body>
+
+<div class="sidebar">
+  <h2>企业知识库 RAG</h2>
+  <label>API 地址</label>
+  <input id="baseUrl" value="http://127.0.0.1:8000" placeholder="http://127.0.0.1:8000">
+  <label>Token (先调 /login 获取)</label>
+  <input id="token" value="" placeholder="Bearer xxx">
+  <button onclick="login()">获取 Token</button>
+  <label>用户名</label>
+  <input id="username" value="zhangsan">
+  <label>密码</label>
+  <input id="password" type="password" value="123456">
+  <hr style="border-color:#333">
+  <label>会话 ID</label>
+  <input id="conversationId" value="" placeholder="自动生成">
+  <button onclick="newSession()" style="background:#0f3460">新建会话</button>
+</div>
+
+<div class="main">
+  <div class="header">
+    <span id="userInfo">请先登录</span>
+  </div>
+  <div class="messages" id="messages">
+    <div class="msg assistant">你好！我是企业知识库助手，请先登录后提问。</div>
+  </div>
+  <div class="input-area">
+    <input id="questionInput" placeholder="输入你的问题..." onkeydown="if(event.key==='Enter') sendMessage()">
+    <button id="sendBtn" onclick="sendMessage()">发送</button>
+  </div>
+</div>
+
+<script>
+let currentAssistantDiv = null;
+
+async function login() {
+  const resp = await fetch(`${baseUrl.value}/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: `username=${username.value}&password=${password.value}`
+  });
+  if (resp.ok) {
+    const data = await resp.json();
+    token.value = data.access_token;
+    userInfo.textContent = `已登录: ${username.value}`;
+    addMessage('assistant', '登录成功！可以开始提问了。');
+    newSession();
+  } else {
+    addMessage('assistant', '登录失败，请检查用户名密码。');
+  }
+}
+
+async function newSession() {
+  const resp = await fetch(`${baseUrl.value}/chat/session`, {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${token.value}` }
+  });
+  if (resp.ok) {
+    const data = await resp.json();
+    conversationId.value = data.conversation_id;
+  }
+}
+
+async function sendMessage() {
+  const question = questionInput.value.trim();
+  if (!question || !token.value) return;
+
+  addMessage('user', question);
+  questionInput.value = '';
+  sendBtn.disabled = true;
+
+  // 创建空的 assistant 消息框等待流式填充
+  const msgDiv = addMessage('assistant', '');
+  currentAssistantDiv = msgDiv;
+
+  // 思考中动画
+  const loadingEl = document.createElement('div');
+  loadingEl.className = 'loading';
+  loadingEl.textContent = '思考中...';
+  msgDiv.appendChild(loadingEl);
+
+  // 答案文本放在独立 span 里, 不和来源 div 冲突
+  const answerSpan = document.createElement('span');
+  let fullText = '';
+
+  try {
+    const resp = await fetch(`${baseUrl.value}/chat/stream`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token.value}`
+      },
+      body: JSON.stringify({
+        conversation_id: conversationId.value || 'default',
+        question: question
+      })
+    });
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const json = line.slice(6).trim();
+        if (!json) continue;
+        try {
+          const event = JSON.parse(json);
+          if (event.type === 'token') {
+            if (loadingEl) { loadingEl.remove(); loadingEl = null; }
+            if (!answerSpan.parentNode) {
+              msgDiv.appendChild(answerSpan);
+            }
+            fullText += event.data;
+            answerSpan.textContent = fullText;
+            // 25ms = 刚好够浏览器 60fps 刷新一帧
+            await new Promise(r => setTimeout(r, 25));
+          } else if (event.type === 'done') {
+            if (!answerSpan.parentNode) {
+              msgDiv.appendChild(answerSpan);
+              answerSpan.textContent = event.answer || fullText;
+            }
+            if (event.sources && event.sources.length > 0) {
+              const srcDiv = document.createElement('div');
+              srcDiv.className = 'sources';
+              srcDiv.innerHTML = '引用来源: ' + event.sources.map(s =>
+                `<span>${s.source} (P${s.page})</span>`
+              ).join(' ');
+              msgDiv.appendChild(srcDiv);
+            }
+          }
+        } catch(e) {}
+      }
+    }
+  } catch(e) {
+    if (loadingEl) loadingEl.remove();
+    msgDiv.textContent = '请求失败: ' + e.message;
+  }
+
+  sendBtn.disabled = false;
+  currentAssistantDiv = null;
+}
+
+function addMessage(role, text) {
+  const div = document.createElement('div');
+  div.className = `msg ${role}`;
+  div.textContent = text;
+  messages.appendChild(div);
+  messages.scrollTop = messages.scrollHeight;
+  return div;
+}
+</script>
+</body>
+</html>

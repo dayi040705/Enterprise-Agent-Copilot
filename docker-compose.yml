@@ -1,0 +1,45 @@
+version: "3.8"
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: rag-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: "123456"
+      MYSQL_DATABASE: enterprise_rag
+    ports:
+      - "3307:3306"       # 映射到 3307 避免和本地 MySQL 冲突
+    volumes:
+      - mysql_data:/var/lib/mysql
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build: ./backend
+    container_name: rag-backend
+    ports:
+      - "8000:8000"
+    environment:
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY}"
+      DEEPSEEK_MODEL: "${DEEPSEEK_MODEL:-deepseek-v4-pro}"
+      DATABASE_URL: "mysql+pymysql://root:123456@mysql:3306/enterprise_rag"
+      HF_HOME: /app/models/.cache   # HuggingFace 缓存目录
+    depends_on:
+      mysql:
+        condition: service_healthy
+    volumes:
+      # 模型文件 (bge-small-zh)
+      - ./models:/app/models:ro
+      # ChromaDB 向量库持久化
+      - ./backend/chroma_db:/app/chroma_db
+      # 上传的文档持久化
+      - ./backend/data:/app/data
+      # 日志持久化
+      - ./backend/logs:/app/logs
+
+volumes:
+  mysql_data:
