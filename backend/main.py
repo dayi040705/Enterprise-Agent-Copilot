@@ -5,8 +5,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-from db_models import user
-from db_models import document
+from db_models import user, document, business
 
 from api.chat import router
 from api.upload import router as upload_router

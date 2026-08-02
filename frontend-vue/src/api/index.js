@@ -48,6 +48,50 @@ export function chatStream(question, conversationId, token) {
 }
 
 // ========== 历史 ==========
+export function agentStream(question, conversationId, token) {
+  return fetch('http://127.0.0.1:8000/chat/agent/stream', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${token}`
+    },
+    body: JSON.stringify({ question, conversation_id: conversationId || 'default' })
+  })
+}
+
+export function plannerStream(question, conversationId, token) {
+  return fetch('http://127.0.0.1:8000/chat/planner/stream', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${token}`
+    },
+    body: JSON.stringify({ question, conversation_id: conversationId || 'default' })
+  })
+}
+
+export function multiAgentStream(question, conversationId, token) {
+  return fetch('http://127.0.0.1:8000/chat/multi-agent/stream', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${token}`
+    },
+    body: JSON.stringify({ question, conversation_id: conversationId || 'default' })
+  })
+}
+
+export function unifiedStream(question, conversationId, token) {
+  return fetch('http://127.0.0.1:8000/chat/unified/stream', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${token}`
+    },
+    body: JSON.stringify({ question, conversation_id: conversationId || 'default' })
+  })
+}
+
 export const getHistory = () => api.get('/chat/history')
 
 // ========== 文档管理 ==========

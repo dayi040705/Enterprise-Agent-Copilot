@@ -27,13 +27,16 @@ services:
       DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY}"
       DEEPSEEK_MODEL: "${DEEPSEEK_MODEL:-deepseek-v4-pro}"
       DATABASE_URL: "mysql+pymysql://root:123456@mysql:3306/enterprise_rag"
-      HF_HOME: /app/models/.cache   # HuggingFace 缓存目录
+      HF_HUB_OFFLINE: "1"
+      HF_HOME: /root/.cache/huggingface   # HuggingFace 缓存目录
     depends_on:
       mysql:
         condition: service_healthy
     volumes:
       # 模型文件 (bge-small-zh)
-      - ./models:/app/models:ro
+      - ./models:/models:ro
+      # HuggingFace 模型缓存 (避免重新下载)
+      - C:/Users/28298/.cache/huggingface:/root/.cache/huggingface
       # ChromaDB 向量库持久化
       - ./backend/chroma_db:/app/chroma_db
       # 上传的文档持久化

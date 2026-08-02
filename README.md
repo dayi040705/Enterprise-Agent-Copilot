@@ -1,10 +1,10 @@
-# Enterprise RAG Assistant — 企业级知识库问答系统
+# Enterprise-Agent-Copilot 企业智能运维助手 Agent
 
-基于 RAG（检索增强生成）架构的企业内部知识库智能问答系统。支持多部门权限隔离、文档版本管理、混合检索 + Reranker 精排、流式输出，附带 LLM Judge 自动评测体系。
+企业知识库问答 + Multi-Agent 智能运维协作文档系统。从 RAG 检索增强生成到 Supervisor + 3 Specialist Agent + Reporter + Reviewer 分工协作，覆盖知识库搜索、日志分析、数据库查询、故障报告生成与自动审查。
 
-**59 个 Python 文件 · 3300+ 行代码 · 184 个依赖包**
+**100+ Python 文件 · 8000+ 行代码 · FastAPI + Vue3 全栈**
 
-![聊天界面](backend/docs/images/chat-streaming.png)
+![聊天界面](backend/docs/images/agent-chat.png)
 
 ## 架构
 
@@ -45,6 +45,40 @@
   对话记录)          BGE Reranker)
 ```
 
+## Agent 架构（Multi-Agent 协作）
+
+```
+                          用户问题
+                             │
+                             ▼
+                     ┌──────────────┐
+                     │    Router     │  ← 意图分类
+                     │  (复杂度判断)  │
+                     └──────┬───────┘
+                            │
+              ┌─────────────┼─────────────┐
+              ▼             ▼             ▼
+        简单查询        工具调用        复杂任务
+         (RAG)        (单Agent)     (Multi-Agent)
+                                          │
+                              ┌───────────┼───────────┐
+                              ▼           ▼           ▼
+                         Knowledge    Diagnostic     Action
+                          Agent         Agent        Agent
+                        (搜知识库)    (查日志+历史)  (查数据库)
+                              │           │           │
+                              └───────────┼───────────┘
+                                          ▼
+                                    ┌──────────┐
+                                    │ Reporter │  ← 综合生成报告
+                                    └────┬─────┘
+                                         ▼
+                                    ┌──────────┐
+                                    │ Reviewer │  ← LLM Judge 审查
+                                    │ faith    │     不通过→补查→重生成
+                                    └──────────┘
+```
+
 ## 核心特性
 
 ### 检索增强生成 (RAG)
@@ -61,14 +95,25 @@
 - **用户审批流程**: 自主注册 → 管理员审批 → 分配部门
 - **SSE 流式输出**: 打字机效果，首 token 延迟 < 2 秒
 
-![管理后台](backend/docs/images/admin-panel.png)
+![Agent 聊天](backend/docs/images/agent-chat.png)
+
+### Multi-Agent 智能运维
+- **意图路由**: LLM 自动判断复杂度，简单查询 RAG 秒回，复杂任务多 Agent 协作
+- **并行执行**: `asyncio.gather` 3 个专项 Agent 同时工作，共享 Evidence Store
+- **Supervisor 拆解**: 复杂问题自动分解为子任务，Knowledge/Diagnostic/Action 三路并行
+- **Reporter + Reviewer 闭环**: 流式生成报告 → LLM Judge 审查 → 不通过自动补查重生成
+- **Agent Memory**: 短期会话上下文 + 长期 ChromaDB 故障经验积累
+- **Pydantic Guardrail**: 参数校验 + 表白名单 + 15s 超时保护
+
+![Multi-Agent 协作](backend/docs/images/multi-agent.png)
+
+![Trace 执行树](backend/docs/images/agent-trace.png)
 
 ### 评测体系
-- **LLM Judge 自动评分**: DeepSeek 充当裁判，8 道测试题自动打分
-- **Faithfulness 95.7%**: 答案忠实于检索到的文档内容
-- **Answer Relevancy 100%**: 答案紧扣用户问题
+- **RAG 评测**: LLM Judge — Faithfulness 95.7% / Relevancy 100%
+- **Agent 评测**: Tool Success Rate / LLM Judge / Token 统计 / Cost 估算 / Latency 分析
 
-### 日志系统
+### 应用日志管理
 - 双通道输出: 控制台 (DEBUG) + 文件 (INFO)
 - 按天轮转，保留 30 天
 
@@ -86,7 +131,9 @@
 | Reranker | BAAI/bge-reranker-base (FlagEmbedding) |
 | 认证 | JWT (python-jose) + bcrypt |
 | 文档解析 | PyPDF2 |
-| 评测 | 自研 LLM Judge (DeepSeek) |
+| Agent 框架 | LangGraph (状态图编排) + 手写 ReAct |
+| 评测 | 自研 LLM Judge (RAG + Agent 双评测体系) |
+| 部署 | Docker Compose 一键部署 |
 
 ## 快速开始
 
@@ -156,7 +203,12 @@ uvicorn main:app --reload
 | `/login` | POST | 用户登录, 返回 JWT |
 | `/register` | POST | 自主注册 |
 | `/chat` | POST | 普通聊天 (一次性返回) |
-| `/chat/stream` | POST | 流式聊天 (SSE 逐字推送) |
+| `/chat/unified/stream` | POST | **统一入口**: Query Rewrite + Router 自动分发 (默认) |
+| `/chat/stream` | POST | RAG 流式聊天 (SSE 逐字推送) |
+| `/chat/agent/stream` | POST | Agent 流式聊天 (工具调用可见) |
+| `/chat/planner/stream` | POST | Planner Agent (计划+执行+流式报告) |
+| `/chat/multi-agent/stream` | POST | Multi-Agent 协作 (5 Agent + Reviewer) |
+| `/chat/trace/{id}` | GET | Agent 执行树 (Trace 可视化) |
 | `/chat/session` | POST | 创建新会话 |
 | `/chat/history` | GET | 获取历史记录 |
 | `/upload` | POST | 上传文档 (PDF/TXT) |
@@ -171,19 +223,50 @@ uvicorn main:app --reload
 
 ## 评测结果
 
+### RAG 评测 (test_evaluation.py)
+
 8 道测试题覆盖 HR/TECH 两个部门 4 份文档：
 
 ```
 Faithfulness       95.7%  ████████████████████████████
 Answer Relevancy   100.0% ████████████████████████████
-
-综合评定: 优秀 — 8道测试题均正确检索并生成高质量回答
 ```
 
+### Agent 评测 (test_agent_eval.py)
+
+14 道测试题覆盖全部 6 个场景：
+
+```
+Router Accuracy      64.3%   (9/14, 偏保守: 宁可多跑不漏判)
+Tool Success Rate   100.0%   零工具执行异常
+Faithfulness        97.1%    答案忠实于证据
+Relevancy           100.0%   完全切题
+Avg Calls / Case    4.1      每次任务平均 4 次工具调用
+Avg TTF             9.1s     首 token 延迟
+Avg Total Time      24.0s    完整任务耗时
+Cost / Case         $0.001   单次任务约 0.1 美分
+```
+
+| 类别 | 用例 | Avg Calls | Faithfulness |
+|------|:----:|:---------:|:------------:|
+| RAG | 3 | 3.7 | **100%** |
+| Agent | 3 | 4.0 | 87% |
+| Planner | 2 | 6.5 | **100%** |
+| Memory | 2 | 5.0 | **100%** |
+| Database | 3 | 1.7 | **100%** |
+| 混合 | 1 | 7.0 | **100%** |
+
+![Agent 评测](backend/docs/images/agent-eval.png)
+
 ```bash
-# 跑评测
+# RAG 评测
 python test_evaluation.py
-# 报告输出: evaluation_report.json
+
+# Agent 评测
+python test_agent_eval.py
+
+# 全量测试
+pytest
 ```
 
 ![评测报告](backend/docs/images/eval-report.png)
@@ -217,8 +300,14 @@ Enterprise-RAG-Assistant/
 │   │   ├── embedding.py         #   BGE Embedding
 │   │   ├── llm.py               #   DeepSeek API (普通+流式)
 │   │   ├── chroma.py            #   ChromaDB 向量库
-│   │   ├── document.py          #   文档解析 (PDF/TXT)
-│   │   ├── evaluation.py        #   LLM Judge 评测
+│   │   ├── document.py          #   文档解析 (PDF/Word/MD/TXT)
+│   │   ├── agent.py             #   ReAct Agent (手写+LangGraph)
+│   │   ├── executor.py          #   工具执行引擎 (插件化)
+│   │   ├── graph.py             #   LangGraph 状态图
+│   │   ├── multi_agent.py       #   Multi-Agent 协作系统
+│   │   ├── database.py          #   业务数据库查询 (MySQL)
+│   │   ├── evaluation.py        #   RAG LLM Judge 评测
+│   │   ├── agent_eval.py        #   Agent 多维度评测
 │   │   ├── prompt.py            #   Prompt 管理中心
 │   │   ├── auth.py              #   JWT 签发/校验
 │   │   └── dependency.py        #   FastAPI 依赖注入

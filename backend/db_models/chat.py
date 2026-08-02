@@ -53,6 +53,10 @@ class ChatRecord(Base):
         nullable=True
     )
 
+    trace_data = Column(
+        Text,
+        nullable=True
+    )
 
     created_time = Column(
         DateTime,
