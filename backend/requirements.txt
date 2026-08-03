@@ -10,6 +10,10 @@ python-dotenv
 python-jose[cryptography]
 bcrypt
 pypdf
+# === OCR 可选依赖: pip install paddlepaddle paddleocr PyMuPDF ===
+# paddlepaddle
+# paddleocr
+# PyMuPDF
 python-docx
 rank-bm25
 jieba
