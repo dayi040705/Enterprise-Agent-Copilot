@@ -81,13 +81,40 @@ def save_memory(problem: str, solution: str, department: str) -> str | None:
 
 
 def _search_memory_raw(query: str, department: str, top_k: int = 3):
+    """
+    搜索长期记忆, 自动过滤过期记录。
+    过期条件: expire_at 已过当前时间 (ChromaDB $gte 过滤)。
+    """
     vector = embedding_texts([query])[0]
+    now = datetime.now().isoformat()
     r = _memory_collection.query(
         query_embeddings=[vector], n_results=top_k,
-        where={"department": department},
-        include=["documents", "distances"],
+        where={
+            "$and": [
+                {"department": department},
+                {"expire_at": {"$gte": now}},  # 只返回未过期的
+            ]
+        },
+        include=["documents", "distances", "metadatas"],
     )
-    return list(zip(r.get("documents", [[]])[0], r.get("distances", [[]])[0]))
+    docs = r.get("documents", [[]])[0]
+    dists = r.get("distances", [[]])[0]
+    metas = r.get("metadatas", [[]])[0]
+
+    # 经验越旧, 相似度分数轻微降权 (6个月后的开始衰减)
+    result = []
+    for i, (doc, dist, meta) in enumerate(zip(docs, dists, metas)):
+        age_label = ""
+        if meta and "expire_at" in meta:
+            try:
+                expire_dt = datetime.fromisoformat(meta["expire_at"])
+                remaining = (expire_dt - datetime.now()).days
+                if remaining < 180:  # 半年内过期 → 标注
+                    age_label = " ⚠️较旧(仅供参考)"
+            except Exception:
+                pass
+        result.append((doc + age_label, dist))
+    return result
 
 
 # ============================================================

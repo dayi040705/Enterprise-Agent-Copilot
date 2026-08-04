@@ -416,27 +416,31 @@ async def _reporter(state: SharedState, extra_context: str = "") -> str:
 ## 各Agent收集的证据:
 {summary}
 
+## 第一步: 矛盾检测 (生成报告前必须执行)
+逐条对比所有证据, 如果两条证据对同一事实的描述矛盾:
+  - start/finish_service 返回 "Redis 连接正常" vs search_logs 返回 "Redis timeout 30次"
+  → 标为 ⚠️ 证据冲突: 两方分别引用了什么, 可能原因(时间差? 查的范围不同?)
+  → 不选边站, 不隐藏矛盾
+
 ## 输出格式要求 (必须遵守):
+
+### ⚠️ 证据冲突 (如有)
+每条冲突单独一行, 说明矛盾的双方 + 可能的解释。
+如果没有冲突, 写 "无"。
 
 ### 已确认事实
 每条事实单独一行, 后面用 [→ Agent名 / 工具名 / 来源] 标注证据。
 
-示例:
-- payment-service 在 10:05 出现 Redis timeout [→ Diagnostic / search_logs / payment-service.log L15]
-- 工单 TKT-002 记录相同问题已解决 [→ Action / query_database / tickets]
-
 ### 推测原因
-基于证据的推测, 标注置信度(高/中/低)和依据。
-
-示例:
-- 连接池不足 (置信度:中, 依据: 日志显示连接池使用率98%, 但未直接证明)
+基于证据的推测, 标注置信度(高/中/低)和依据。如果有证据冲突, 给出两种可能 + 各自的依据。
 
 ### 待确认 (缺失信息)
-列出还需要什么数据才能确认根因。
+列出还需要什么数据才能确认根因。证据冲突项目优先列出。
 
 ## 绝对禁止:
 - 没有 [→ Agent/工具/来源] 标注的事实声明
 - "根因是XXX" 这种确定性结论(除非证据100%证实)
+- 在证据矛盾时自行选边站, 隐瞒矛盾
 - 报告中出现知识库/日志中不存在的具体数据
 
 只输出报告:"""
@@ -461,7 +465,15 @@ async def _reporter_stream(state: SharedState, extra_context: str = ""):
 证据:
 {summary}
 
-要求: 每条事实标注 [→ Agent/工具/来源]。不确定的标注(推测)。没有证据的不写。
+第一步: 矛盾检测 — 证据之间有矛盾时标 ⚠️ 证据冲突, 不选边。
+
+输出格式:
+### ⚠️ 证据冲突 (如有)
+### 已确认事实 (每条标注 [→ Agent/工具/来源])
+### 推测原因 (标注置信度)
+### 待确认 (缺失信息)
+
+禁止: 证据矛盾时选边站 / 编造数据 / 无来源标注。
 只输出报告:"""
     stream = await client.chat.completions.create(
         model=DEEPSEEK_MODEL,
@@ -488,20 +500,19 @@ async def _reviewer_v2(state: SharedState) -> dict:
 {report[:2000]}
 
 ## 评判标准:
-- faithfulness: 报告内容是否基于收集到的证据(没有凭空编造)? 只要有引用证据就给高分。
-- relevancy: 回答是否紧扣问题? 只要切题就给高分。
-- passed: faith>=0.5 AND relev>=0.6 (只要有证据支撑+切题就过)
+- faithfulness: 报告内容是否基于证据(没有编造)? 引用了证据就给高分。
+- relevancy: 切题?
+- consistency: 证据之间有矛盾时, 报告是否标注了 ⚠️ 冲突而不是隐瞒或选边站?
+- passed: faith>=0.5 AND relev>=0.6 (有证据支撑+切题就过)
 
-## 如果未通过, 必须指出:
-- missing_evidence: 缺失哪些关键信息 (只描述缺什么, 不指定谁去查)
-- 如果只是信息不够(不是编造), faith 仍应 >=0.5
+## 如果未通过:
+- missing_evidence: 缺失哪些信息 (只描述缺什么)
+- inconsistency: 如果报告在证据矛盾时选边站了, 指出具体矛盾
 
-## 输出 JSON:
+输出 JSON:
 {{"faithfulness":0.0-1.0,"relevancy":0.0-1.0,"passed":true/false,
-  "feedback":"一句话",
-  "missing_evidence":["缺失项1","缺失项2"]}}
+  "feedback":"一句话","missing_evidence":[],"inconsistency":"(如有)"}}
 
-注意: 不要输出 next_action。你的职责是判断缺什么, 不是决定谁去查。
 只输出 JSON:"""
     resp = await client.chat.completions.create(
         model=DEEPSEEK_MODEL, messages=[{"role": "user", "content": prompt}], temperature=0)
