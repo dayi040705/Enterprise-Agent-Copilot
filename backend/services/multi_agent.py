@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from openai import AsyncOpenAI
 from config import DEEPSEEK_API_KEY, DEEPSEEK_MODEL
 from services.executor import execute as exec_tool, save_memory as exec_save_memory
+from services.executor import MCPOrdersParams, QueryAnalyticsParamsV2, QueryListingParams, QuerySyncLogsParams
 from services.chroma import client as chroma_client
 from services.embedding import embedding_texts
 
@@ -141,25 +142,25 @@ def search_incidents(query: str, department: str, top_k: int = 3) -> list[str]:
 
 class SearchKBInput(BaseModel):
     query: str = Field(..., min_length=1, description="搜索关键词")
-    department: str = Field(..., pattern="^(HR|TECH)$")
+    department: str = Field(..., pattern="^(HR|TECH|运营部|客服部|供应链部)$")
 
 class SearchLogsInput(BaseModel):
-    service: str = Field(..., pattern="^(user-service|order-service|payment-service)$")
+    service: str = Field(..., pattern="^(user-service|order-service|payment-service|sp-api|inventory-service)$")
     keyword: str = Field(default="")
 
 class SearchMemoryInput(BaseModel):
     query: str = Field(..., min_length=1)
-    department: str = Field(..., pattern="^(HR|TECH)$")
+    department: str = Field(..., pattern="^(HR|TECH|运营部|客服部|供应链部)$")
 
-class QueryDBInput(BaseModel):
-    table: str = Field(..., pattern="^(employees|tickets|leave_records)$")
-    name: str = Field(default="")
-    dept: str = Field(default="")
-    status: str = Field(default="")
+class QueryMySQLInput(BaseModel):
+    sql: str = Field(..., min_length=5, max_length=500, description="SELECT 查询语句。可用表: products/orders/order_items/order_reviews/sellers/order_payments/sync_logs")
+
+class QueryAnalyticsInput(BaseModel):
+    sql: str = Field(..., min_length=5, max_length=500, description="SELECT 查询语句。查趋势/聚合用。可用表: sales_daily/listing_snapshots/sync_etl_log")
 
 class SearchIncidentsInput(BaseModel):
     query: str = Field(..., min_length=1, description="问题描述, 如'Redis超时'")
-    department: str = Field(..., pattern="^(HR|TECH)$")
+    department: str = Field(..., pattern="^(HR|TECH|运营部|客服部|供应链部)$")
 
 
 def _make_tool(name: str, desc: str, model: type[BaseModel]) -> dict:
@@ -180,13 +181,17 @@ KNOWLEDGE_TOOLS = [
 ]
 
 DIAGNOSTIC_TOOLS = [
-    _make_tool("search_logs", "搜索服务器日志", SearchLogsInput),
-    _make_tool("search_memory", "搜索历史故障经验", SearchMemoryInput),
-    _make_tool("search_incidents", "搜索历史故障事件库(同类问题以前怎么解决的)", SearchIncidentsInput),
+    _make_tool("query_sync_logs", "查数据管道健康度(录入率/失败原因) — 优先用这个!", QuerySyncLogsParams),
+    _make_tool("search_logs", "搜GitHub开源社区的真实技术问题/故障案例(外部参考)", SearchLogsInput),
+    _make_tool("search_memory", "搜索历史运营经验", SearchMemoryInput),
+    _make_tool("search_incidents", "搜索历史事件库(同类问题以前怎么解决的)", SearchIncidentsInput),
 ]
 
 ACTION_TOOLS = [
-    _make_tool("query_database", "查询业务数据库", QueryDBInput),
+    _make_tool("query_orders", "查订单状态。参数:status(delivered/canceled/空=全部),limit(默认10)", MCPOrdersParams),
+    _make_tool("query_analytics", "查销量/退款率/库存预警(OLAP预聚合,毫秒级)。参数:metric(top_refund/top_sales/low_stock/trend),limit(默认5)", QueryAnalyticsParamsV2),
+    _make_tool("query_listing", "查Listing评分/评价数/健康度。参数:sku(可选),category(可选),limit(默认10)", QueryListingParams),
+    _make_tool("query_sync_logs", "查SP-API数据管道同步健康度(录入率/失败原因)。参数:hours(默认24)", QuerySyncLogsParams),
 ]
 
 # ── 第1处: Agent 任务边界 ──
@@ -204,21 +209,28 @@ AGENTS = {
     "diagnostic": {
         "name": "Diagnostic Agent",
         "system": (
-            "你是故障诊断专家。只负责查服务器日志和搜索历史故障经验。"
-            "不负责搜索知识库文档、不负责查数据库。"
-            "分析错误日志的根因,引用具体日志行。"
+            "你是系统诊断专家。工具使用优先级:\n"
+            "1. query_sync_logs — 查管道录入率/失败(内部数据,优先)\n"
+            "2. search_memory — 搜历史运营异常处理经验(内部)\n"
+            "3. search_incidents — 搜历史事件库\n"
+            "4. search_logs — 搜GitHub开源社区真实技术案例(外部参考,最后手段)\n"
+            "不负责搜知识库文档、不负责查业务数据库。"
         ),
         "tools": DIAGNOSTIC_TOOLS,
     },
     "action": {
         "name": "Action Agent",
         "system": (
-            "你是业务数据查询专家。只能查以下表:\n"
-            "- tickets: IT工单 (故障/事故/异常/超时必查)\n"
-            "- employees: 员工信息 (查人/通讯录时用)\n"
-            "- leave_records: 请假记录 (查请假/假期时用)\n\n"
-            "规则: 故障排查任务只查 tickets。不要查无关员工和请假数据。"
-            "结构化输出查询结果。"
+            "你是电商业务数据查询专家。有 4 个工具:\n"
+            "🟢 mcp_query_analytics(status/limit) — 查退款率Top N/销量趋势(推荐,不用写SQL)\n"
+            "🟢 mcp_query_orders(status/limit) — 查订单(推荐,不用写SQL)\n"
+            "🔵 query_mysql(sql) — 复杂自定义SQL查实时订单/商品/评价\n"
+            "🔵 query_analytics(sql) — 复杂自定义SQL查预聚合趋势\n\n"
+            "规则:\n"
+            "1. 优先用MCP工具(不用写SQL,不会出错)\n"
+            "2. MCP不够用时再用自定义SQL\n"
+            "3. analytics.sales_daily是预聚合表,查退款率/销量趋势用它,别三表JOIN\n"
+            "4. 查完后直接给出答案,不要反复调工具\n"
         ),
         "tools": ACTION_TOOLS,
     },
@@ -340,19 +352,22 @@ async def _execute_parallel(state: SharedState, yield_cb=None) -> dict:
 # ── Supervisor ──
 
 async def _supervisor_plan(question: str) -> list[dict]:
-    prompt = f"""你是任务调度专家。有 3 个 Agent:
+    prompt = f"""你是电商运营调度专家。有 3 个 Agent:
 
-- knowledge: 搜企业知识库 (文档/制度/技术手册/通讯录)
-- diagnostic: 查服务器日志 + 搜索历史故障经验 + 搜索历史事件库(search_incidents)
-- action: 查数据库, 但严格按场景限定:
-  故障排查 → 只查 tickets(工单), 禁止查 employees/leave_records
-  人员查询 → 只查 employees
-  请假查询 → 只查 leave_records
+- knowledge: 搜电商 SOP 知识库 (售后处理/广告策略/Listing优化/跟卖应对/库存管理)
+- diagnostic: 查数据异常 + 搜索历史经验 + 查 sync_logs 数据管道日志
+- action: 查电商业务数据库, 有两个数据源:
+  🔵 query_mysql — 实时订单/商品: products, orders, order_items, order_reviews, sellers, sync_logs
+  🟢 query_analytics — OLAP预聚合(毫秒级): analytics.sales_daily (日销量/退款率/均价), analytics.listing_snapshots
 
 将问题拆为子任务。JSON 数组:
-[{{"agent": "knowledge|diagnostic|action", "task": "具体描述(含约束)"}}]
+[{{"agent": "knowledge|diagnostic|action", "task": "具体任务描述(含要查哪张表或什么SOP)"}}]
 
-注意: 任务描述里要明确告诉 Action Agent 查哪张表, 故障场景只查 tickets。
+规则:
+- 数据查询(退款率/销量) → action, 走 query_analytics 查 sales_daily (预聚合,快)
+- SOP查询(退货/广告) → knowledge, 搜知识库
+- 复杂诊断(转化率暴跌需排查评分+广告+跟卖) → 拆分给 action+knowledge+diagnostic
+
 问题: {question}
 只输出 JSON:"""
     resp = await client.chat.completions.create(
@@ -372,7 +387,7 @@ async def _supervisor_plan(question: str) -> list[dict]:
 async def _supervisor_replan(question: str, missing_evidence: list[str]) -> list[dict]:
     """Supervisor: 根据 Reviewer 发现的缺失项, 生成补查任务"""
     missing_text = "\n".join(f"- {m}" for m in missing_evidence)
-    prompt = f"""你是任务调度专家。Reviewer 审查后发现以下信息缺失:
+    prompt = f"""你是电商运营调度专家。Reviewer 审查后发现以下信息缺失:
 
 原始问题: {question}
 
@@ -380,9 +395,9 @@ async def _supervisor_replan(question: str, missing_evidence: list[str]) -> list
 {missing_text}
 
 请为每个缺失项生成一个补查任务, 分配给最合适的 Agent:
-- knowledge: 搜知识库
-- diagnostic: 查日志 + 查历史故障
-- action: 查数据库(故障只查tickets)
+- knowledge: 搜电商 SOP 知识库
+- diagnostic: 查 sync_logs + 历史经验
+- action: 查数据(query_mysql查实时/query_analytics查趋势)
 
 输出 JSON 数组:
 [{{"agent": "knowledge|diagnostic|action", "task": "具体任务描述"}}]
@@ -469,9 +484,11 @@ async def _reporter_stream(state: SharedState, extra_context: str = ""):
 
 输出格式:
 ### ⚠️ 证据冲突 (如有)
-### 已确认事实 (每条标注 [→ Agent/工具/来源])
+### 已确认事实 (直接列出所有查询到的具体数据——SKU/数字/百分比,不能只说"已查询")。每条标注 [→ Agent/工具/来源]
 ### 推测原因 (标注置信度)
 ### 待确认 (缺失信息)
+
+重要: 已确认事实部分必须包含查询工具返回的原始数据(SKU ID的前8位、销量数字、退款率百分比、金额)!禁用"已识别""已生成"等抽象描述!
 
 禁止: 证据矛盾时选边站 / 编造数据 / 无来源标注。
 只输出报告:"""
@@ -532,32 +549,38 @@ async def _reviewer_v2(state: SharedState) -> dict:
 async def _route_intent(question: str) -> tuple[str, str]:
     """三路 Router: 返回 (route, agent_type)
 
-    knowledge:  问制度/流程/规范 → Knowledge Agent (search_kb)
-    diagnostic: 查日志/历史故障 → Diagnostic Agent (search_logs/search_memory)
-    action:     查员工/请假/工单 → Action Agent (query_database)
-    complex:    多数据源+分析报告 → 完整 Multi-Agent
+    knowledge:  问流程/SOP/策略 → Knowledge Agent (search_kb)
+    diagnostic: 查数据异常/趋势 → Diagnostic Agent (search_logs/search_memory)
+    action:     查具体数据 → Action Agent (query_mysql / query_analytics)
+    complex:    多源交叉+诊断报告 → 完整 Multi-Agent
     """
-    prompt = f"""你是企业 IT 系统的路由专家。分析用户意图，只回答一个词。
+    prompt = f"""你是电商运营系统的路由专家。分析用户意图，只回答一个词。
 
 判断标准(优先级从高到低):
 
-1. complex — 满足任意一条:
-   - 提到"报告"、"分析报告"、"根因分析"、"故障报告"
-   - 提到"全面排查"、"深度排查"、"综合"
-   - 涉及 3 个及以上不同的数据源(日志+工单+知识库+历史)
-   - 需要对比、汇总、给出结论
+1. action — 单一数据查询，满足任意一条:
+   - "退款率最高的是哪个"、"哪个SKU卖得最好"、"最近订单"
+   - "查一下XX数据"、"XX有多少"、"XX是什么"
+   - 只需要查一张表或一个数据源的简单查询
 
-2. diagnostic — 只查日志/查服务状态:
-   - "报什么错"、"查一下日志"、"有没有异常"
+2. knowledge — 只问流程/SOP/策略:
+   - "退货怎么处理"、"广告怎么投放"、"跟卖怎么办"
+   - "XX的流程是什么"、"有什么规范"
 
-3. knowledge — 只问制度/流程/规定:
-   - "请假流程"、"VPN怎么连"、"密码要求"
+3. diagnostic — 查数据异常/趋势:
+   - 单维度对比: "过去7天销量趋势"、"退款率变化"
+   - "有没有异常波动"、"为什么XX下降了"
 
-4. action — 只查数据库:
-   - "有几个工单"、"张三在哪个部门"
+4. complex — 多源交叉诊断，满足任意一条:
+   - 涉及 2 个及以上数据源(数据库+知识库+历史经验)
+   - 提到"全面排查"、"诊断报告"、"根因分析"
+   - 需要对比多个维度才能得出结论(如"转化率暴跌,排查评分+广告+跟卖")
 
-如果同时有"查日志"+"出报告" → complex
-如果只有"查日志" → diagnostic
+规则:
+- "查退款率最高" → action (单次查询,不是排障)
+- "退货流程" → knowledge (SOP)
+- "转化率暴跌,全面排查" → complex (需要跨数据源对比)
+- "查XX然后分析" → action (数据查询+简单解释)
 
 用户问题: {question}
 

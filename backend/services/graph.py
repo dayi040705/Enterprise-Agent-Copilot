@@ -217,7 +217,7 @@ async def run_agent_stream(user_message: str, department: str = "HR",
 # ── ReAct (真正 Token 流式) ──
 
 async def run_agent_stream_tokens(user_message: str, department: str = "HR",
-                                  conversation_id: str = "", max_calls: int = 15):
+                                  conversation_id: str = "", max_calls: int = 8):
     """逐 token 流式 + Analyzer 闭环 + 去重"""
     cid = conversation_id or hashlib.md5(user_message.encode()).hexdigest()[:12]
     config = {"configurable": {"thread_id": cid}}
@@ -230,18 +230,30 @@ async def run_agent_stream_tokens(user_message: str, department: str = "HR",
         msgs = slim[-6:] + [{"role": "user", "content": user_message}]
     else:
         msgs = [
-            {"role": "system", "content": f"你是企业运维 Agent。必须先调工具再回答, 禁止瞎编。每条信息注明来源。具体>笼统。部门: {department}。"},
+            {"role": "system", "content": f"你是电商运营分析 Agent。核心规则: ①先调工具查数据 ②回答时每条事实必须标注来源[SOP文件名/数据源/具体的数字] ③不标注来源=不合格 ④数据够了就直接回答,最多调5次工具。部门: {department}。"},
             {"role": "user", "content": user_message},
         ]
 
     calls, streak = 0, 0
-    seen_calls: set[str] = set()  # 去重: 同工具同参数不重复调
+    useless_streak = 0  # 连续无效调用计数
+    seen_calls: set[str] = set()
     full_answer = ""
-    analyzer_rounds = 0  # Analyzer 最多触发 2 次
+    analyzer_rounds = 0
 
-    for _ in range(12):
+    for _ in range(max_calls):
+        # 条件4: 达到上限 → 强制输出
         if calls >= max_calls:
-            full_answer = "已达最大调用次数，基于已有信息给出回答。"
+            full_answer = "[已达上限] 基于已有信息: " + (full_answer or "未能收集到足够数据,请联系人工处理")
+            break
+
+        # 条件3: 达到70%配额 + 已有有效数据 → 收尾
+        if calls >= max_calls * 0.7 and useless_streak >= 1 and full_answer:
+            full_answer = "[已达70%配额] " + full_answer
+            break
+
+        # 条件2: 连续2次无新信息 + 有数据 → 收尾
+        if useless_streak >= 2 and full_answer:
+            full_answer = "[连续无新信息] " + full_answer
             break
 
         stream = await client.chat.completions.create(
@@ -291,6 +303,7 @@ async def run_agent_stream_tokens(user_message: str, department: str = "HR",
                 # 去重
                 call_key = f"{name}:{json.dumps(args, sort_keys=True)}"
                 if call_key in seen_calls:
+                    useless_streak += 1
                     msgs.append({"role": "tool", "tool_call_id": tc["id"],
                                  "content": "[跳过] 相同工具+参数已调用过, 请换方式或直接回答。"})
                     continue
@@ -298,6 +311,12 @@ async def run_agent_stream_tokens(user_message: str, department: str = "HR",
 
                 yield json.dumps({"type": "tool_call", "tool": name, "args": args}, ensure_ascii=False)
                 result = exec_tool(name, args, department, streak)
+                # 追踪无效调用
+                if "未找到" in result or "无结果" in result or "异常" in result:
+                    useless_streak += 1
+                else:
+                    useless_streak = 0  # 有效信息,重置
+
                 if name == "search_knowledge_base":
                     if "建议停止" in result: streak = 99
                     elif "未找到" in result: streak += 1
@@ -326,7 +345,9 @@ async def run_agent_stream_tokens(user_message: str, department: str = "HR",
             break
 
     if not full_answer:
-        full_answer = "无法完成完整分析。部分信息可能缺失。"
+        full_answer = ("[已达工具调用上限] 基于已收集数据,"
+                       "请整理以上结果并给出最终分析。如果数据不足以回答,"
+                       "明确说明缺失什么信息。")
 
     msgs.append({"role": "assistant", "content": full_answer})
     await agent_graph.aupdate_state(config, {"messages": msgs, "final_answer": full_answer,

@@ -391,6 +391,86 @@ async def chat_unified_stream(
     )
 
 
+@router.post("/chat/daily-briefing")
+async def daily_briefing(
+    current_user: dict = Depends(get_current_user),
+):
+    """每日运营晨报 — Agent 自动查询并生成报告"""
+    department = current_user["department"]
+    briefing_prompt = f"""生成今日电商运营晨报。并行查询以下数据后汇总:
+
+1. query_analytics(metric="top_sales", limit=5) → 昨日销量最高 SKU
+2. query_analytics(metric="top_refund", limit=5) → 退款率异常 SKU
+3. query_analytics(metric="low_stock", limit=10) → 库存预警
+4. query_sync_logs → SP-API 数据管道健康度 (不要用query_mysql)
+5. query_listing(limit=10) → Listing 评分健康度
+6. search_memory → 最近运营经验
+
+输出格式:
+## 📊 运营晨报
+### 昨日销量 Top 5
+### ⚠️ 退款预警
+### 📦 库存预警
+### 🔄 数据管道
+### ⭐ Listing 健康度
+### 💡 今日建议"""
+
+    accumulated = {"answer": "", "session_id": ""}
+    async def sse_generator():
+        async for event_json in multi_agent_chat(briefing_prompt, department):
+            event = json.loads(event_json)
+            if event["type"] == "done":
+                accumulated["answer"] = event["answer"]
+                accumulated["session_id"] = event.get("session_id", "")
+            yield f"data: {event_json}\n\n"
+
+    return StreamingResponse(
+        sse_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.post("/chat/listing-diagnosis")
+async def listing_diagnosis(
+    request: ChatRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Listing 诊断 Skill — 输入 SKU, 自动查评分/退款/跟卖/广告"""
+    department = current_user["department"]
+    sku = request.question.strip()
+    diagnosis_prompt = f"""对 SKU {sku} 做完整诊断。并行查询:
+
+1. query_listing(sku="{sku}") → 查评分/评价数/品类/价格
+2. query_analytics(metric="top_refund") → 查退款率, 关注这个 SKU
+3. query_analytics(metric="trend") → 查 30 天销量趋势
+4. search_knowledge_base → 搜跟卖应对 SOP (判断是否可能被跟卖)
+5. search_memory → 搜历史类似诊断经验
+6. query_sync_logs → 查数据管道正常与否
+
+生成诊断报告, 列出:
+### SKU 基础信息
+### 退款率诊断
+### 销量趋势
+### 跟卖风险评估
+### 综合建议"""
+
+    accumulated = {"answer": "", "session_id": ""}
+    async def sse_generator():
+        async for event_json in multi_agent_chat(diagnosis_prompt, department):
+            event = json.loads(event_json)
+            if event["type"] == "done":
+                accumulated["answer"] = event["answer"]
+                accumulated["session_id"] = event.get("session_id", "")
+            yield f"data: {event_json}\n\n"
+
+    return StreamingResponse(
+        sse_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @router.get("/chat/trace/{session_id}")
 def get_trace(session_id: str, current_user: dict = Depends(get_current_user)):
     """返回 Multi-Agent 完整执行树"""

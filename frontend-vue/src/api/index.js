@@ -92,6 +92,19 @@ export function unifiedStream(question, conversationId, token) {
   })
 }
 
+export function dailyBriefing(token) {
+  return fetch('http://127.0.0.1:8000/chat/daily-briefing', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` }
+  })
+}
+export function listingDiagnosis(sku, token) {
+  return fetch('http://127.0.0.1:8000/chat/listing-diagnosis', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+    body: JSON.stringify({ question: sku, conversation_id: 'listing-diag' })
+  })
+}
 export const getHistory = () => api.get('/chat/history')
 
 // ========== 文档管理 ==========

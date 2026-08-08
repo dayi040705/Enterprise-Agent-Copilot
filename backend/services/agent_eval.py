@@ -12,6 +12,7 @@ import json, time
 from openai import AsyncOpenAI
 from config import DEEPSEEK_API_KEY, DEEPSEEK_MODEL
 from services.agent import agent_chat_stream
+from services.multi_agent import multi_agent_chat
 from services.multi_agent import _route_intent
 
 judge_client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
@@ -21,47 +22,65 @@ PRICE_INPUT = 0.28   # $0.28 / 1M input tokens
 PRICE_OUTPUT = 1.10  # $1.10 / 1M output tokens
 
 TEST_CASES = [
-    # ===== RAG: 纯知识库检索 =====
-    {"question": "请假流程是什么？需要谁审批？",
-     "department": "HR", "tags": ["RAG"], "expected_tools": ["search_knowledge_base"]},
-    {"question": "公司 VPN 怎么配置？密码有什么要求？",
-     "department": "TECH", "tags": ["RAG"], "expected_tools": ["search_knowledge_base"]},
-    {"question": "病假和事假的工资怎么算？有什么区别？",
-     "department": "HR", "tags": ["RAG"], "expected_tools": ["search_knowledge_base"]},
+    # ===== 数据查询 — OLTP 实时数据 =====
+    {"question": "帮我查一下最近 10 个已取消的订单, 看看他们的订单状态和时间",
+     "department": "TECH", "tags": ["数据查询"], "expected_tools": ["query_mysql"]},
+    {"question": "查询评分最高的前 5 个 Listing, 列出它们的品类和评价数",
+     "department": "TECH", "tags": ["数据查询"], "expected_tools": ["query_mysql"]},
+    {"question": "过去 30 天销量最高的 5 个 SKU 分别卖了多少？",
+     "department": "TECH", "tags": ["数据查询"], "expected_tools": ["query_analytics"]},
 
-    # ===== Agent: 工具调用 =====
-    {"question": "user-service 日志里有什么错误？",
-     "department": "TECH", "tags": ["Agent"], "expected_tools": ["search_logs"]},
-    {"question": "payment-service 今天有没有支付失败的记录？",
-     "department": "TECH", "tags": ["Agent"], "expected_tools": ["search_logs"]},
-    {"question": "order-service 为什么变慢了？看看日志",
-     "department": "TECH", "tags": ["Agent"], "expected_tools": ["search_logs"]},
+    # ===== 数据查询 — OLAP 趋势分析 =====
+    {"question": "退款率最高的 3 个 SKU 是什么？各退了多少单？退款率分别是多少？",
+     "department": "TECH", "tags": ["数据查询"], "expected_tools": ["query_analytics"]},
+    {"question": "最近 30 天销量趋势怎么样？每天卖了多少、收入多少？",
+     "department": "TECH", "tags": ["数据查询"], "expected_tools": ["query_analytics"]},
+    {"question": "平均评分最低的 5 个 Listing 是哪些？它们的评价数和品类是什么？",
+     "department": "TECH", "tags": ["数据查询"], "expected_tools": ["query_mysql"]},
 
-    # ===== Planner: 多步复杂任务 =====
-    {"question": "payment-service Redis 超时了, 查日志+工单+历史经验, 出完整故障报告",
-     "department": "TECH", "tags": ["Planner"],
-     "expected_tools": ["search_logs", "query_database", "search_memory"]},
-    {"question": "user-service 接口500错误, 全面排查日志、数据库连接、历史事故, 出根因分析",
-     "department": "TECH", "tags": ["Planner"],
-     "expected_tools": ["search_logs", "search_memory", "search_knowledge_base"]},
+    # ===== 知识库检索 — 电商 SOP =====
+    {"question": "买家收到破损商品要求退货, 我应该怎么处理？流程是什么？",
+     "department": "TECH", "tags": ["知识检索"], "expected_tools": ["search_knowledge_base"]},
+    {"question": "跟卖是什么？如果有人跟卖我的 Listing, 我该怎么应对？",
+     "department": "TECH", "tags": ["知识检索"], "expected_tools": ["search_knowledge_base"]},
+    {"question": "新品上架后怎么投放广告？广告预算和 ACOS 怎么控制？",
+     "department": "TECH", "tags": ["知识检索"], "expected_tools": ["search_knowledge_base"]},
+    {"question": "库存低于安全库存线了, 补货的流程和需要注意什么？",
+     "department": "TECH", "tags": ["知识检索"], "expected_tools": ["search_knowledge_base"]},
 
-    # ===== Memory: 长期记忆检索 =====
-    {"question": "之前数据库连接池耗尽那次是怎么解决的？",
-     "department": "TECH", "tags": ["Memory"], "expected_tools": ["search_memory"]},
-    {"question": "以前 Redis 连接超时有过什么处理方案？",
-     "department": "TECH", "tags": ["Memory"], "expected_tools": ["search_memory"]},
+    # ===== 异常诊断 — 单维度排查 =====
+    {"question": "SKU 51a41e5b 的评分是多少？有什么评价？",
+     "department": "TECH", "tags": ["异常诊断"], "expected_tools": ["query_mysql"]},
+    {"question": "今天 SP-API 数据同步的录入率是多少？有没有失败的批次？失败原因是什么？",
+     "department": "TECH", "tags": ["异常诊断"], "expected_tools": ["query_mysql"]},
+    {"question": "SKU 51a41e5b 的价格和评分是多少？",
+     "department": "TECH", "tags": ["异常诊断"], "expected_tools": ["query_listing"]},
 
-    # ===== Database: 业务数据查询 =====
-    {"question": "张三在 HR 部门的请假记录有哪些？",
-     "department": "HR", "tags": ["Database"], "expected_tools": ["query_database"]},
-    {"question": "最近有哪些待处理的 IT 工单？谁在处理？",
-     "department": "TECH", "tags": ["Database"], "expected_tools": ["query_database"]},
-    {"question": "TECH 部门有哪些在职员工？",
-     "department": "TECH", "tags": ["Database"], "expected_tools": ["query_database"]},
+    # ===== 复杂排障 — 多源交叉诊断 =====
+    {"question": "Listing 51a41e5b 转化率从 8% 跌到 2% 了, 全面排查: 查评分变化、查退款率趋势、查跟卖应对 SOP、查广告投放策略, 输出诊断报告",
+     "department": "TECH", "tags": ["复杂排障"],
+     "expected_tools": ["query_mysql", "query_analytics", "search_knowledge_base"]},
+    {"question": "过去 7 天退款率突然从 2% 飙升到 8%, 全面排查: 查退款率高的 SKU、查差评内容、查售后处理 SOP、查历史类似事故经验",
+     "department": "TECH", "tags": ["复杂排障"],
+     "expected_tools": ["query_analytics", "query_mysql", "search_knowledge_base", "search_memory"]},
 
-    # ===== 混合: 多工具协作 =====
-    {"question": "给我查一下payment-service今天有没有Redis超时的错误日志，再帮我看看有没有相关的未解决工单",
-     "department": "TECH", "tags": ["混合"], "expected_tools": ["search_logs", "query_database"]},
+    # ===== 长期记忆 — 历史经验 =====
+    {"question": "上次 Listing 被恶意差评那次是怎么处理的？最后恢复了吗？",
+     "department": "TECH", "tags": ["记忆检索"], "expected_tools": ["search_memory"]},
+    {"question": "之前 PrimeDay 备货不足那次是怎么处理的？后来吸取了什么教训？",
+     "department": "TECH", "tags": ["记忆检索"], "expected_tools": ["search_memory"]},
+
+    # ===== 数据管道 — sync_logs 监控 =====
+    {"question": "查一下最近 24 小时 SP-API 数据同步的健康度, 录入率是多少？哪个表的同步有异常？",
+     "department": "TECH", "tags": ["数据管道"], "expected_tools": ["query_mysql"]},
+
+    # ===== 混合 — 多工具协作 =====
+    {"question": "给我查一下退款率最高的 SKU 是什么, 然后看看对应的 Listing 评分变化, 再查一下售后处理应该怎么做",
+     "department": "TECH", "tags": ["混合"],
+     "expected_tools": ["query_analytics", "query_mysql", "search_knowledge_base"]},
+    {"question": "查一下最近有没有库存预警的 SKU, 然后告诉我库存管理规范里补货的流程是什么",
+     "department": "TECH", "tags": ["混合"],
+     "expected_tools": ["query_analytics", "search_knowledge_base"]},
 ]
 
 
@@ -82,9 +101,11 @@ faithfulness 评判标准:
 - 0.0: 完全编造, 与工具返回数据矛盾
 
 注意:
-- 报告中正常出现"建议"和"可能原因"不应给0分
-- 只要 Agent 确实调了工具并引用了结果, 基线分不低于 0.3
-- 报告不引用任何工具数据才给 0 分
+- 只要Agent确实调了工具且回答切题,基线分不低于0.4——即使没显式标注来源
+- 完全没调工具就回答=0分
+- 调了工具但答案和工具返回的数据矛盾=0分
+- 建议和推测不扣分
+- relevancy切题就高,不用太严
 
 relevancy 评判标准:
 - 1.0: 直接回答了用户问的每个子问题, 没有跑题也没有遗漏
@@ -126,7 +147,7 @@ async def run_agent_eval() -> dict:
     """多维度 Agent 评测"""
     cases = []
     total_calls = total_errors = total_input_tokens = total_output_tokens = 0
-    total_ttf = 0.0  # Time To First token
+    total_ttf = 0.0
     total_latency = 0.0
     faith_scores = []; relev_scores = []
     router_correct = 0; router_total = 0
@@ -137,7 +158,7 @@ async def run_agent_eval() -> dict:
         # Router 评测 (不阻塞主流程)
         try:
             route, agent = await _route_intent(case["question"])
-            expected_route = "complex" if case.get("tags") and "Planner" in case["tags"] else "simple"
+            expected_route = "complex" if case.get("tags") and "复杂排障" in case["tags"] else "simple"
             if route == expected_route:
                 router_correct += 1
             router_total += 1
@@ -153,9 +174,11 @@ async def run_agent_eval() -> dict:
         user_msg = case["question"]
         tokens_in = _estimate_tokens(sys_prompt) + _estimate_tokens(user_msg)
 
-        async for event_json in agent_chat_stream(
-            case["question"], case["department"], f"eval_v2_{i}"
-        ):
+        # 复杂排障 → Multi-Agent, 其余 → 单 Agent
+        is_complex = case.get("tags") and "复杂排障" in case["tags"]
+        stream_source = multi_agent_chat(case["question"], case["department"]) if is_complex else \
+                        agent_chat_stream(case["question"], case["department"], f"eval_v2_{i}")
+        async for event_json in stream_source:
             ev = json.loads(event_json)
 
             if ev["type"] in ("tool_call", "tool_start"):

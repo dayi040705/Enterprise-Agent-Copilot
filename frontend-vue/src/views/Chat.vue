@@ -1,9 +1,9 @@
 <template>
-  <el-container style="height:100vh">
+  <el-container style="height:100vh;background:#1a1a2e">
     <!-- 侧边栏 -->
-    <el-aside width="260px" style="background:#304156;color:#fff;display:flex;flex-direction:column">
-      <div style="padding:16px;font-size:16px;font-weight:bold;border-bottom:1px solid #4a5a6a">
-        📚 RAG 知识库
+    <el-aside width="260px" style="background:#16213e;color:#e0e0e0;display:flex;flex-direction:column;border-right:1px solid #0f3460">
+      <div style="padding:16px;font-size:16px;font-weight:bold;border-bottom:1px solid #0f3460;color:#e94560">
+        Enterprise Agent Copilot
       </div>
       <div style="padding:12px">
         <el-button type="primary" @click="newSession" style="width:100%">
@@ -33,10 +33,16 @@
     </el-aside>
 
     <!-- 聊天区 -->
-    <el-main style="display:flex;flex-direction:column;padding:0;background:#f5f7fa">
-      <div class="chat-header">
+    <el-main style="display:flex;flex-direction:column;padding:0;background:#1a1a2e">
+      <div class="chat-header" style="background:#16213e;border-bottom:1px solid #0f3460;color:#e0e0e0;padding:12px 20px;display:flex;align-items:center;gap:12px">
         <span>会话: {{ conversationId?.slice(0, 8) || '未创建' }}...</span>
         <el-radio-group v-model="chatMode" size="small" style="margin-left:16px">
+          <el-button type="success" size="small" @click="sendDailyBriefing" :disabled="sending" style="margin-right:4px">
+            晨报
+          </el-button>
+          <el-button type="warning" size="small" @click="sendListingDiagnosis" :disabled="sending" style="margin-right:8px">
+            Listing诊断
+          </el-button>
           <el-radio-button value="unified">Unified</el-radio-button>
           <el-radio-button value="rag">RAG</el-radio-button>
           <el-radio-button value="agent">Agent</el-radio-button>
@@ -50,9 +56,9 @@
       </div>
 
       <div class="chat-messages" ref="msgContainer">
-        <div v-if="messages.length===0" style="text-align:center;color:#999;margin-top:200px">
-          <el-icon :size="48"><ChatDotRound /></el-icon>
-          <p style="margin-top:16px">输入问题，开始对话</p>
+        <div v-if="messages.length===0" style="text-align:center;color:#555;margin-top:200px">
+          <el-icon :size="48" color="#555"><ChatDotRound /></el-icon>
+          <p style="margin-top:16px;color:#666">输入问题，开始对话</p>
         </div>
 
         <div v-for="(msg, i) in messages" :key="i"
@@ -63,13 +69,21 @@
             <div class="plan-title">执行计划</div>
             <div v-for="(s, j) in msg.plan" :key="j" class="plan-step">{{ j+1 }}. {{ s }}</div>
           </div>
-          <!-- Agent 工具调用卡片 -->
-          <div v-if="msg.toolCalls?.length" class="tool-calls">
-            <div v-for="(tc, j) in msg.toolCalls" :key="j" class="tool-card">
-              <span class="tool-badge">TOOL</span>
-              <span class="tool-name">{{ tc.tool }}</span>
-              <span class="tool-args">{{ JSON.stringify(tc.args) }}</span>
-            </div>
+          <!-- Agent 工具调用卡片 — 可折叠 -->
+          <div v-if="msg.toolCalls?.length" class="tool-calls" style="margin:8px 0">
+            <details style="background:#252547;border-radius:8px;padding:8px 12px;font-size:12px">
+              <summary style="cursor:pointer;color:#7ec8e3;font-weight:500">
+                TOOLS ({{ msg.toolCalls.length }})
+              </summary>
+              <div v-for="(tc, j) in msg.toolCalls" :key="j"
+                   style="margin-top:6px;padding:6px 8px;background:#1a1a3e;border-radius:4px;border-left:3px solid #e94560">
+                <span style="color:#e94560;font-weight:600">{{ tc.tool }}</span>
+                <span style="color:#aaa;margin-left:8px">{{ JSON.stringify(tc.args).slice(0, 100) }}</span>
+                <div v-if="tc.result" style="color:#7ec8e3;margin-top:4px;max-height:60px;overflow:hidden">
+                  {{ tc.result?.slice(0, 120) }}
+                </div>
+              </div>
+            </details>
           </div>
           <div class="msg-text">{{ msg.content }}</div>
           <div v-if="msg.traceLink" style="margin-top:6px">
@@ -102,7 +116,7 @@ import { ref, reactive, onMounted, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { Plus, Promotion, Upload, ChatDotRound } from '@element-plus/icons-vue'
-import { getHistory, createSession, chatStream, agentStream, plannerStream, multiAgentStream, unifiedStream, uploadFile } from '../api'
+import { getHistory, createSession, chatStream, agentStream, plannerStream, multiAgentStream, unifiedStream, dailyBriefing, listingDiagnosis, uploadFile } from '../api'
 
 const router = useRouter()
 const username = ref(localStorage.getItem('username') || '用户')
@@ -330,6 +344,75 @@ async function sendPlannerMessage(q) {
   } catch (e) {
     assistantMsg.content = '请求失败: ' + e.message
   }
+}
+
+async function sendDailyBriefing() {
+  sending.value = true
+  const assistantMsg = reactive({ role: 'assistant', content: '', toolCalls: [], plan: [], sessionId: '' })
+  messages.value.push(assistantMsg)
+  try {
+    const resp = await dailyBriefing(localStorage.getItem('token'))
+    const reader = resp.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() || ''
+      for (const line of lines) {
+        const dataLine = line.startsWith('data: ') ? line.slice(6).trim() : ''
+        if (!dataLine) continue
+        try {
+          const event = JSON.parse(dataLine)
+          if (event.type === 'status') assistantMsg.content += '[' + event.data + ']\n'
+          else if (event.type === 'plan') assistantMsg.plan = event.data || []
+          else if (event.type === 'tool_call' || event.type === 'tool_start') assistantMsg.toolCalls.push({ tool: event.tool, args: event.args, result: '...' })
+          else if (event.type === 'token') { assistantMsg.content += event.data; await nextTick(); scrollBottom() }
+          else if (event.type === 'done') { assistantMsg.content = event.answer || assistantMsg.content; assistantMsg.sessionId = event.session_id || '' }
+          await nextTick(); scrollBottom()
+        } catch (e) {}
+      }
+    }
+  } catch (e) { assistantMsg.content = '日报请求失败: ' + e.message }
+  sending.value = false
+}
+
+async function sendListingDiagnosis() {
+  const sku = question.value.trim() || '51a41e5b'
+  if (sku === question.value.trim()) question.value = ''
+  sending.value = true
+  const assistantMsg = reactive({ role: 'assistant', content: '', toolCalls: [], plan: [], sessionId: '' })
+  messages.value.push({ role: 'user', content: '诊断 SKU: ' + sku })
+  messages.value.push(assistantMsg)
+  try {
+    const resp = await listingDiagnosis(sku, localStorage.getItem('token'))
+    const reader = resp.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() || ''
+      for (const line of lines) {
+        const dataLine = line.startsWith('data: ') ? line.slice(6).trim() : ''
+        if (!dataLine) continue
+        try {
+          const event = JSON.parse(dataLine)
+          if (event.type === 'status') assistantMsg.content += '[' + event.data + ']\n'
+          else if (event.type === 'plan') assistantMsg.plan = event.data || []
+          else if (event.type === 'tool_call' || event.type === 'tool_start') assistantMsg.toolCalls.push({ tool: event.tool, args: event.args, result: '...' })
+          else if (event.type === 'token') { assistantMsg.content += event.data; await nextTick(); scrollBottom() }
+          else if (event.type === 'done') { assistantMsg.content = event.answer || assistantMsg.content; assistantMsg.sessionId = event.session_id || '' }
+          await nextTick(); scrollBottom()
+        } catch (e) {}
+      }
+    }
+  } catch (e) { assistantMsg.content = '诊断请求失败: ' + e.message }
+  sending.value = false
 }
 
 async function sendUnifiedMessage(q) {

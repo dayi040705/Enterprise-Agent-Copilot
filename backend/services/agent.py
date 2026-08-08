@@ -12,15 +12,16 @@ from pydantic import BaseModel, Field
 # ── TOOLS (OpenAI 格式, 给 LLM 看的菜单) ──
 
 TOOLS = [
+    # ── 知识库 + 日志 + 记忆 (保持不变) ──
     {
         "type": "function", "function": {
             "name": "search_knowledge_base",
-            "description": "搜索企业知识库: 制度/流程/技术文档/通讯录。可多次调用。",
+            "description": "搜索电商运营SOP: 售后处理/广告投放/Listing优化/跟卖应对/库存管理。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "搜索关键词"},
-                    "department": {"type": "string", "enum": ["HR", "TECH"]}
+                    "department": {"type": "string", "enum": ["HR", "TECH", "运营部", "客服部", "供应链部"]}
                 },
                 "required": ["query", "department"]
             }
@@ -29,11 +30,11 @@ TOOLS = [
     {
         "type": "function", "function": {
             "name": "search_logs",
-            "description": "搜索服务器运行日志, 分析错误原因。",
+            "description": "搜索电商服务日志。服务: sp-api(数据管道)/order-service(订单)/payment-service(支付)/inventory-service(库存)。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "service": {"type": "string", "description": "服务名: user-service/order-service/payment-service"},
+                    "service": {"type": "string", "description": "服务名"},
                     "keyword": {"type": "string", "description": "关键词, 如 ERROR/timeout"}
                 },
                 "required": ["service"]
@@ -43,34 +44,71 @@ TOOLS = [
     {
         "type": "function", "function": {
             "name": "search_memory",
-            "description": "搜索历史故障处理经验库。",
+            "description": "搜索历史运营经验库: 差评处理/断货补货/跟卖应对经验。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "问题描述"},
-                    "department": {"type": "string", "enum": ["HR", "TECH"]}
+                    "department": {"type": "string", "enum": ["HR", "TECH", "运营部", "客服部", "供应链部"]}
                 },
                 "required": ["query", "department"]
             }
         }
     },
+    # ── 数据查询 (参数化,不用写SQL) ──
     {
         "type": "function", "function": {
-            "name": "query_database",
-            "description": "查询企业业务数据库: 员工信息(employees)、IT工单(tickets)、"
-                           "请假记录(leave_records)。可指定表名+姓名/部门/状态过滤。",
+            "name": "query_orders",
+            "description": "查订单状态。参数: status(delivered/canceled/空=全部), limit(默认10)。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "table": {"type": "string", "description": "表名: employees / tickets / leave_records"},
-                    "name": {"type": "string", "description": "员工姓名, 如'张三'"},
-                    "dept": {"type": "string", "description": "部门: HR / TECH / ADMIN"},
-                    "status": {"type": "string", "description": "状态: 已解决 / 处理中 / 待审批"}
-                },
-                "required": ["table"]
+                    "status": {"type": "string", "description": "订单状态: delivered/canceled/空=全部"},
+                    "limit": {"type": "integer", "description": "返回条数, 默认10"}
+                }
             }
         }
-    }
+    },
+    {
+        "type": "function", "function": {
+            "name": "query_analytics",
+            "description": "查销量/退款率趋势(OLAP预聚合,毫秒级)。查退款率Top N/销量排行/库存预警都用这个工具!别自己写SQL!",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "metric": {"type": "string", "enum": ["top_refund", "top_sales", "low_stock", "trend"],
+                               "description": "查询类型: top_refund=退款率排行/top_sales=销量排行/low_stock=库存预警/trend=趋势"},
+                    "limit": {"type": "integer", "description": "返回条数, 默认5"}
+                }
+            }
+        }
+    },
+    {
+        "type": "function", "function": {
+            "name": "query_listing",
+            "description": "查Listing评分/评价数/健康度。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sku": {"type": "string", "description": "可选, 指定SKU"},
+                    "category": {"type": "string", "description": "可选, 按品类筛选"},
+                    "limit": {"type": "integer", "description": "返回条数, 默认10"}
+                }
+            }
+        }
+    },
+    {
+        "type": "function", "function": {
+            "name": "query_sync_logs",
+            "description": "查SP-API数据管道同步健康度(录入率/失败原因)。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "hours": {"type": "integer", "description": "查最近多少小时, 默认24"}
+                }
+            }
+        }
+    },
 ]
 
 # ── Schema ──

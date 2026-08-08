@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field, ValidationError
 from services.hybrid import hybrid_search
 from services.chroma import client as chroma_client
 from services.embedding import embedding_texts
-from services.database import query_table
+from services.database import _query_oltp, _query_olap
 
 
 # ============================================================
@@ -25,22 +25,23 @@ from services.database import query_table
 
 class SearchKBParams(BaseModel):
     query: str = Field(..., min_length=1, max_length=200)
-    department: str = Field(..., pattern="^(HR|TECH)$")
+    department: str = Field(..., pattern="^(HR|TECH|运营部|客服部|供应链部)$")
 
 class SearchLogsParams(BaseModel):
-    service: str = Field(..., pattern="^(user-service|order-service|payment-service)$")
+    service: str = Field(..., pattern="^(user-service|order-service|payment-service|sp-api|inventory-service)$")
     keyword: str = Field(default="", max_length=50)
 
-class QueryDBParams(BaseModel):
-    table: str = Field(..., pattern="^(employees|tickets|leave_records)$",
-                       description="表名: employees / tickets / leave_records")
-    name: str = Field(default="", max_length=50, description="员工姓名")
-    dept: str = Field(default="", max_length=50, description="部门: HR / TECH / ADMIN")
-    status: str = Field(default="", max_length=20, description="工单状态: 已解决 / 处理中 / 待审批")
+class QueryMySQLParams(BaseModel):
+    sql: str = Field(..., min_length=5, max_length=500,
+                     description="SQL 查询语句 (SELECT only). 可用表见 schema 描述")
+
+class QueryAnalyticsParams(BaseModel):
+    sql: str = Field(..., min_length=5, max_length=500,
+                     description="SQL 查询语句 (SELECT only). 可用表: sales_daily/listing_snapshots/sync_etl_log")
 
 class SearchMemoryParams(BaseModel):
     query: str = Field(..., min_length=1, max_length=200)
-    department: str = Field(..., pattern="^(HR|TECH)$")
+    department: str = Field(..., pattern="^(HR|TECH|运营部|客服部|供应链部)$")
 
 
 # ============================================================
@@ -73,7 +74,7 @@ def save_memory(problem: str, solution: str, department: str) -> str | None:
         metadatas=[{
             "problem": problem[:200], "department": department,
             "time": datetime.now().isoformat(),
-            "expire_at": datetime.now().replace(year=datetime.now().year+1).isoformat(),
+            "expire_at": int((datetime.now().replace(year=datetime.now().year+1)).timestamp()),
         }],
         ids=[doc_id],
     )
@@ -86,15 +87,9 @@ def _search_memory_raw(query: str, department: str, top_k: int = 3):
     过期条件: expire_at 已过当前时间 (ChromaDB $gte 过滤)。
     """
     vector = embedding_texts([query])[0]
-    now = datetime.now().isoformat()
     r = _memory_collection.query(
-        query_embeddings=[vector], n_results=top_k,
-        where={
-            "$and": [
-                {"department": department},
-                {"expire_at": {"$gte": now}},  # 只返回未过期的
-            ]
-        },
+        query_embeddings=[vector], n_results=top_k * 2,  # 多取一些, Python 层过滤
+        where={"department": department},
         include=["documents", "distances", "metadatas"],
     )
     docs = r.get("documents", [[]])[0]
@@ -102,18 +97,26 @@ def _search_memory_raw(query: str, department: str, top_k: int = 3):
     metas = r.get("metadatas", [[]])[0]
 
     # 经验越旧, 相似度分数轻微降权 (6个月后的开始衰减)
+    now = datetime.now()
     result = []
     for i, (doc, dist, meta) in enumerate(zip(docs, dists, metas)):
-        age_label = ""
         if meta and "expire_at" in meta:
             try:
-                expire_dt = datetime.fromisoformat(meta["expire_at"])
-                remaining = (expire_dt - datetime.now()).days
-                if remaining < 180:  # 半年内过期 → 标注
-                    age_label = " ⚠️较旧(仅供参考)"
+                exp = meta["expire_at"]
+                if isinstance(exp, (int, float)) and exp > 1000000:
+                    expire_dt = datetime.fromtimestamp(float(exp))
+                elif isinstance(exp, str):
+                    expire_dt = datetime.fromisoformat(exp)
+                else:
+                    result.append((doc, dist)); continue
+                if (expire_dt - now).days <= 0:
+                    continue  # 过期, 跳过
+                if (expire_dt - now).days < 180:
+                    doc += " [较旧,仅供参考]"
             except Exception:
                 pass
-        result.append((doc + age_label, dist))
+        result.append((doc, dist))
+        if len(result) >= top_k: break
     return result
 
 
@@ -138,10 +141,50 @@ def _execute_search_kb(query: str, department: str = "HR",
 
 
 def _execute_search_logs(service: str, keyword: str = "", **kwargs) -> str:
+    # === 电商服务日志 (优先) ===
+    svc_map = {
+        "payment-service": "payment-service.log",
+        "order-service": "order-service.log",
+        "inventory-service": "inventory-service.log",
+        "sp-api": "sp-api.log",
+        "user-service": "sp-api.log",
+    }
+    log_file_name = svc_map.get(service, f"{service}.log")
+
+    # === 真实数据源: GitHub Issues API (外部参考) ===
+    try:
+        import requests
+        query = f"{service} {keyword}".strip()
+        resp = requests.get(
+            "https://api.github.com/search/issues",
+            params={"q": query, "per_page": 5, "sort": "created", "order": "desc"},
+            headers={"Accept": "application/vnd.github.v3+json"},
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            items = resp.json().get("items", [])
+            if not items:
+                return (f"[GitHub Issues] 未找到与 '{query}' 相关的 issue。"
+                        f"建议换关键词重试或查看其他数据源。")
+            lines = [f"GitHub Issues: 搜索 '{query}', 共 {resp.json().get('total_count', 0)} 条, 展示前 5:"]
+            for i, iss in enumerate(items):
+                repo = iss.get("repository_url", "").split("/")[-1] if "repository_url" in iss else "unknown"
+                lines.append(
+                    f"[{i+1}] [{repo}] {iss['title']} "
+                    f"| 状态:{iss['state']} | 创建:{iss['created_at'][:10]} | "
+                    f"标签:{','.join(l['name'] for l in iss.get('labels', [])) or '无'}"
+                )
+            return "\n".join(lines)
+        if resp.status_code == 403:
+            return "[GitHub API 限流] 请稍后重试。本地 mock 数据可作为备用。"
+    except Exception:
+        pass  # API 挂了 → fallback 到本地 mock
+
+    # === Fallback: 本地电商服务日志 (基于真实订单数据) ===
     log_dir = Path(__file__).resolve().parent.parent / "logs"
-    log_file = log_dir / f"{service}.log"
+    log_file = log_dir / log_file_name
     if not log_file.exists():
-        return f"[错误] 日志文件 {service}.log 不存在。"
+        return f"[错误] 日志文件 {service}.log 不存在, 且 GitHub API 不可用。"
     with open(log_file, "r", encoding="utf-8") as f:
         lines = f.readlines()
     if keyword.strip():
@@ -171,39 +214,125 @@ def _execute_search_memory(query: str, department: str = "HR", **kwargs) -> str:
         return f"[长期记忆异常] {e}"
 
 
-def _execute_query_db(table: str, name: str = "", dept: str = "",
-                      status: str = "", **kwargs) -> str:
-    """查询企业业务数据库 — 员工/工单/请假记录"""
-    filters = {}
-    if name: filters["name"] = name
-    if dept: filters["dept"] = dept
-    if status: filters["status"] = status
+def _execute_query_mysql(sql: str, **kwargs) -> str:
+    """OLTP 查询 — 实时交易数据 (products/orders/reviews 等)"""
+    # 安全检查: 只允许 SELECT
+    clean = sql.strip()
+    if not clean.upper().startswith("SELECT"):
+        return "[拒绝] query_mysql 只允许 SELECT 查询"
+    return _query_oltp(clean)
 
-    try:
-        result = query_table(table, filters)
-        rows = result["rows"]
-        if not rows:
-            return (f"表 {table} 中未找到匹配记录。"
-                    f"可用表: employees(员工) / tickets(工单) / leave_records(请假)")
-        # 格式化输出
-        lines = [f"[{table}] 共 {result['total']} 条"]
-        for row in rows[:10]:  # 最多10条
-            line = " | ".join(f"{k}:{v}" for k, v in row.items())
-            lines.append(line[:500])
-        return "\n".join(lines)
-    except Exception as e:
-        return f"[数据库查询异常] {e}"
+
+def _execute_query_analytics(sql: str, **kwargs) -> str:
+    """OLAP 查询 — 预聚合趋势数据 (sales_daily 等)"""
+    clean = sql.strip()
+    if not clean.upper().startswith("SELECT"):
+        return "[拒绝] query_analytics 只允许 SELECT 查询"
+    return _query_olap(clean)
 
 
 # ============================================================
 # 工具注册表
 # ============================================================
 
+# ── 电商参数化工具 ──
+
+class QueryAnalyticsParamsV2(BaseModel):
+    metric: str = Field(default="top_refund", pattern="^(top_refund|top_sales|low_stock|trend)$")
+    limit: int = Field(default=5, ge=1, le=20)
+
+class QueryListingParams(BaseModel):
+    sku: str = Field(default="")
+    category: str = Field(default="")
+    limit: int = Field(default=10, ge=1, le=20)
+
+class QuerySyncLogsParams(BaseModel):
+    hours: int = Field(default=24, ge=1, le=168)
+
+
+def _execute_analytics_v2(metric: str = "top_refund", limit: int = 5, **kwargs) -> str:
+    """参数化 analytics 查询 — 所有日期以数据实际最大日期为准"""
+    if metric == "top_refund":
+        return _query_olap(f"""
+            WITH latest AS (SELECT MAX(date) as max_d FROM analytics.sales_daily)
+            SELECT sku, SUM(units_sold) as sold, AVG(refund_rate) as rr
+            FROM analytics.sales_daily
+            WHERE date > DATE_SUB((SELECT max_d FROM latest), INTERVAL 90 DAY)
+            GROUP BY sku HAVING sold > 10
+            ORDER BY rr DESC LIMIT {limit}
+        """)
+    elif metric == "top_sales":
+        return _query_olap(f"""
+            WITH latest AS (SELECT MAX(date) as max_d FROM analytics.sales_daily)
+            SELECT sku, SUM(units_sold) as sold, SUM(revenue) as rev
+            FROM analytics.sales_daily
+            WHERE date > DATE_SUB((SELECT max_d FROM latest), INTERVAL 30 DAY)
+            GROUP BY sku ORDER BY sold DESC LIMIT {limit}
+        """)
+    elif metric == "low_stock":
+        return _query_olap(f"""
+            WITH max_date AS (SELECT MAX(date) as max_d FROM analytics.sales_daily)
+            SELECT sku,
+                   SUM(CASE WHEN date > DATE_SUB((SELECT max_d FROM max_date), INTERVAL 7 DAY) THEN units_sold ELSE 0 END) as recent,
+                   SUM(CASE WHEN date > DATE_SUB((SELECT max_d FROM max_date), INTERVAL 30 DAY) THEN units_sold ELSE 0 END) as month
+            FROM analytics.sales_daily
+            GROUP BY sku HAVING month > 5 AND recent = 0
+            LIMIT {limit}
+        """)
+    elif metric == "trend":
+        return _query_olap(f"""
+            WITH latest AS (SELECT MAX(date) as max_d FROM analytics.sales_daily)
+            SELECT date, SUM(units_sold) as sold, SUM(revenue) as rev, AVG(refund_rate) as rr
+            FROM analytics.sales_daily
+            WHERE date > DATE_SUB((SELECT max_d FROM latest), INTERVAL 30 DAY)
+            GROUP BY date ORDER BY date DESC LIMIT {limit}
+        """)
+
+
+def _execute_listing(sku: str = "", category: str = "", limit: int = 10, **kwargs) -> str:
+    """查 Listing 评分/评价数"""
+    from services.mcp_client import call_mcp_tool
+    return call_mcp_tool("query_listing_health", {"sku": sku, "category": category, "limit": limit})
+
+
+def _execute_sync_logs(hours: int = 24, **kwargs) -> str:
+    """查数据管道健康度"""
+    from services.mcp_client import call_mcp_tool
+    return call_mcp_tool("query_sync_health", {"hours": hours})
+
+
+# MCP 工具调用代理
+def _execute_mcp_orders(status: str = "", limit: int = 10, **kwargs) -> str:
+    from services.mcp_client import call_mcp_tool
+    return call_mcp_tool("query_orders", {"status": status, "limit": limit})
+
+
+def _execute_mcp_analytics(query: str = "", limit: int = 5, **kwargs) -> str:
+    from services.mcp_client import call_mcp_tool
+    if "退款" in query or "refund" in query.lower():
+        return call_mcp_tool("query_analytics_top_refund", {"limit": limit})
+    return call_mcp_tool("query_analytics_sales", {"sku": query, "limit": limit})
+
+
+class MCPOrdersParams(BaseModel):
+    status: str = Field(default="", description="订单状态: delivered/canceled")
+    limit: int = Field(default=10, ge=1, le=50, description="返回条数")
+
+class MCPAnalyticsParams(BaseModel):
+    query: str = Field(default="", description="SKU 或 查询关键词")
+    limit: int = Field(default=5, ge=1, le=20)
+
+
 TOOL_REGISTRY = {
+    # 知识库 + 日志 + 记忆
     "search_knowledge_base": {"model": SearchKBParams, "func": _execute_search_kb},
     "search_logs":           {"model": SearchLogsParams, "func": _execute_search_logs},
     "search_memory":         {"model": SearchMemoryParams, "func": _execute_search_memory},
-    "query_database":        {"model": QueryDBParams, "func": _execute_query_db},
+    # 电商数据查询 (参数化,不用写SQL)
+    "query_orders":          {"model": MCPOrdersParams, "func": _execute_mcp_orders},
+    "query_analytics":       {"model": QueryAnalyticsParamsV2, "func": _execute_analytics_v2},
+    "query_listing":         {"model": QueryListingParams, "func": _execute_listing},
+    "query_sync_logs":       {"model": QuerySyncLogsParams, "func": _execute_sync_logs},
 }
 
 
