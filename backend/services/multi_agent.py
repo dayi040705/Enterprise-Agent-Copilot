@@ -200,9 +200,8 @@ AGENTS = {
     "knowledge": {
         "name": "Knowledge Agent",
         "system": (
-            "你是知识库搜索专家。只负责搜企业文档/制度/通讯录。"
-            "不负责查日志、不负责查数据库。引用文件名+页码。"
-            "任务范围外的问题直接回复'不在我的职责范围'。"
+            "你是电商运营知识库专家。只负责搜电商 SOP(售后/广告/Listing/跟卖/库存)。"
+            "不负责查数据、不负责查日志。引用来源文件名。"
         ),
         "tools": KNOWLEDGE_TOOLS,
     },
@@ -221,12 +220,12 @@ AGENTS = {
     "action": {
         "name": "Action Agent",
         "system": (
-            "你是电商业务数据查询专家。有 4 个工具:\n"
-            "🟢 mcp_query_analytics(status/limit) — 查退款率Top N/销量趋势(推荐,不用写SQL)\n"
-            "🟢 mcp_query_orders(status/limit) — 查订单(推荐,不用写SQL)\n"
-            "🔵 query_mysql(sql) — 复杂自定义SQL查实时订单/商品/评价\n"
-            "🔵 query_analytics(sql) — 复杂自定义SQL查预聚合趋势\n\n"
-            "规则:\n"
+            "你是电商数据查询专家。有 4 个参数化工具:\n"
+            "query_orders — 查订单状态(status/limit)\n"
+            "query_analytics — 查销量/退款率/库存预警(metric/limit)\n"
+            "query_listing — 查Listing评分/评价数(sku/category/limit)\n"
+            "query_sync_logs — 查数据管道健康度(hours)\n"
+            "规则: 先查后答,杜绝编造,标注数据来源。\n"
             "1. 优先用MCP工具(不用写SQL,不会出错)\n"
             "2. MCP不够用时再用自定义SQL\n"
             "3. analytics.sales_daily是预聚合表,查退款率/销量趋势用它,别三表JOIN\n"
