@@ -57,7 +57,7 @@
 ### Multi-Agent 智能诊断
 
 - **Supervisor 拆解**: LLM 自动分析问题，拆解为子任务分配给对应 Agent
-- **三路并行**: Action(数据查询) / Diagnostic(管道诊断) / Knowledge(SOP检索) 通过 `asyncio.gather` 并行执行
+- **三路并行**: Action(数据查询) / Diagnostic(管道诊断) / Knowledge(SOP检索) 通过 `asyncio.as_completed` 并行执行，逐个完成即推送状态
 - **Reporter + Reviewer 闭环**: 自动生成结构化报告 → LLM Judge 审查 → 缺失证据自动补查
 
 ![Multi-Agent 协作](backend/docs/images/multi-agent.png)
@@ -89,13 +89,24 @@
 ### Agent Memory 双轨制
 
 - **短期记忆**: LangGraph Checkpoint 会话上下文
-- **长期记忆**: ChromaDB 故障经验库（带去重 + 过期过滤）
-- **微调实验**: BGE Embedding LoRA 微调，适配电商垂直领域
+- **长期记忆**: ChromaDB 故障经验库（带去重 + 过期过滤 + 时效标注）
 
-### 评测 + 日报
+### Agent Skill 机制
 
-- **20 道评测题**覆盖 7 个场景，LLM Judge 自研评分
-- **每日运营晨报**: 一键并行查询销量/退款/库存/管道/Listing，生成结构化日报
+- **每日运营晨报**: 一键触发，自动并行查询销量/退款/库存/管道/Listing 5 个维度，生成结构化日报
+- **Listing 诊断**: 输入 SKU，自动查评分/退款率/销量趋势/跟卖风险/历史经验，输出完整诊断报告
+- Skill 本质是将运营巡检流程封装为预定义 Prompt 模板，通过 Multi-Agent 通道并行执行
+
+### 评测体系
+
+- **20 道评测题**覆盖数据查询、知识检索、异常诊断、复杂排障、记忆检索、数据管道、混合协作 7 个场景
+- **LLM Judge 自研评分**: Faithfulness（忠实度）/ Relevancy（相关性）双维度
+- **量化指标**: Tool Success Rate / Avg Calls / TTF / Cost
+
+### Embedding 微调实验
+
+- 基于项目内 20 对电商领域训练数据，3 epoch，CPU 7.8s
+- 微调后 10 条检索查询中 8 条保持或提升命中率
 
 ## 快速开始
 
@@ -131,7 +142,7 @@ uvicorn main:app --reload
 | 关系数据库 | MySQL (OLTP) + analytics (OLAP) |
 | 向量数据库 | ChromaDB |
 | LLM | DeepSeek V4 Pro |
-| Embedding | BAAI/bge-small-zh (LoRA 微调) |
+| Embedding | BAAI/bge-small-zh (微调) |
 | Reranker | BAAI/bge-reranker-base |
 | 前端 | Vue3 + Element Plus |
 | 部署 | Docker Compose |
@@ -168,8 +179,10 @@ Cost / Case:         $0.001  单次任务约 0.1 美分
 |------|------|------|
 | `/chat/unified/stream` | POST | 统一入口: Query Rewrite + Router 自动分发 (默认) |
 | `/chat/agent/stream` | POST | Agent 流式聊天 (工具调用可见) |
-| `/chat/multi-agent/stream` | POST | Multi-Agent 协作 (5 Agent + Reviewer) |
-| `/chat/daily-briefing` | POST | 每日运营晨报 (自动并行查询) |
+| `/chat/planner/stream` | POST | Planner Agent — 先推计划再逐步执行 |
+| `/chat/multi-agent/stream` | POST | Multi-Agent 协作 (Supervisor + 3 Agent + Reviewer) |
+| `/chat/daily-briefing` | POST | 每日运营晨报 Skill (自动并行查 5 维度) |
+| `/chat/listing-diagnosis` | POST | Listing 诊断 Skill (输入 SKU → 完整诊断报告) |
 | `/chat/trace/{id}` | GET | Agent 执行树 (Trace 可视化) |
 | `/chat/history` | GET | 历史会话记录 |
 | `/upload` | POST | 上传文档 |
