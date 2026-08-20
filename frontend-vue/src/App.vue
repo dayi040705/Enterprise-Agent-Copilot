@@ -1,5 +1,10 @@
 <template>
-  <router-view />
+  <!-- keep-alive: 跳转到 Trace/Admin 页时保持 Chat 组件状态 (会话/消息不丢失) -->
+  <router-view v-slot="{ Component }">
+    <keep-alive include="Chat">
+      <component :is="Component" />
+    </keep-alive>
+  </router-view>
 </template>
 
 <script setup>

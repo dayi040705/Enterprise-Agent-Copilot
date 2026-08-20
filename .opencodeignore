@@ -1,0 +1,67 @@
+# Git internals — Agent 不需要读历史
+.git/
+
+# Python
+.venv/
+.venv-1/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+backend/.pytest_cache/
+*.so
+*.pyd
+
+# Frontend
+frontend-vue/node_modules/
+frontend-vue/dist/
+
+# Environment
+.env
+backend/.env
+
+# Model weights — 二进制大文件, Agent 读了也没用
+models/
+backend/models/
+*.safetensors
+*.bin
+*.pth
+*.ckpt
+*.onnx
+*.h5
+
+# Vector database — 二进制数据
+backend/chroma_db/
+*.sqlite3
+*.db
+
+# Uploads & data files
+backend/uploads/
+backend/data/
+
+# Logs
+backend/logs/
+*.log
+
+# Images — 截图等对 Agent 无意义
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.svg
+*.ico
+backend/docs/images/
+
+# HuggingFace cache
+huggingface_cache/
+*.cache/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Docker volumes — 运行时数据
+mysql_data/
+DockerData/

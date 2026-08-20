@@ -18,7 +18,7 @@
         </el-form-item>
       </el-form>
       <p style="text-align:center;color:#999;font-size:12px">
-        测试账号: zhangsan / 123456 (HR) | admin / 123456 (管理员)
+        测试账号: dayi / 123456 (运营部) | admin / admin123 (管理员)
       </p>
     </el-card>
   </div>

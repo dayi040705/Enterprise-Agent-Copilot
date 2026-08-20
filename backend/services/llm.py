@@ -8,7 +8,8 @@ from core.exception import LLMException
 client = AsyncOpenAI(
     api_key=DEEPSEEK_API_KEY,
     base_url="https://api.deepseek.com",
-    timeout=30
+    timeout=120,        # 流式回答可能超过 30 秒, 30 会掐断长回答
+    max_retries=2,      # 网络抖动/429 自动重试
 )
 
 

@@ -355,8 +355,8 @@ async def chat_unified_stream(
         yield f"data: {json.dumps({'type': 'route', 'mode': mode_name, 'agent': agent_type}, ensure_ascii=False)}\n\n"
 
         if route == "complex":
-            # Multi-Agent 流程
-            async for event_json in multi_agent_chat(rewritten, department):
+            # Multi-Agent 流程 (复用 Unified 已判定的路由, 不重复调 Router)
+            async for event_json in multi_agent_chat(rewritten, department, pre_route=(route, agent_type)):
                 event = json.loads(event_json)
                 if event["type"] == "done":
                     accumulated["answer"] = event["answer"]
@@ -478,3 +478,24 @@ def get_trace(session_id: str, current_user: dict = Depends(get_current_user)):
     if not trace:
         return {"error": "session not found", "session_id": session_id}
     return trace
+
+
+@router.get("/chat/sample-skus")
+def sample_skus(current_user: dict = Depends(get_current_user)):
+    """Listing 诊断用: 返回 analytics 中销量最高的 SKU 列表 (供前端下拉选择)"""
+    from database.mysql import SessionLocal
+    from sqlalchemy import text
+    db = SessionLocal()
+    try:
+        rows = db.execute(text("""
+            SELECT sku, SUM(units_sold) as sold, AVG(refund_rate) as refund
+            FROM analytics.sales_daily
+            GROUP BY sku HAVING sold > 20
+            ORDER BY sold DESC LIMIT 10
+        """)).fetchall()
+        return [{"sku": r[0], "sold": int(r[1] or 0),
+                 "refund_rate": round(float(r[2] or 0), 1)} for r in rows]
+    except Exception as e:
+        return {"error": str(e)}
+    finally:
+        db.close()

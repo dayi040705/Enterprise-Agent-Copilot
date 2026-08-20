@@ -66,7 +66,8 @@ def save_memory(problem: str, solution: str, department: str) -> str | None:
     except Exception:
         pass
 
-    doc_id = f"mem_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    # 微秒级时间戳: 同秒内多条记忆不会 ID 冲突互相覆盖
+    doc_id = f"mem_{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
     vector = embedding_texts([problem])[0]
     _memory_collection.add(
         documents=[f"问题: {problem}\n解决方案: {solution[:500]}"],

@@ -34,38 +34,50 @@ def init_bm25(department):
     global metadatas_cache
 
 
-    data = collection.get(
-        where={
+    # ADMIN 不受部门限制, 索引全部 active 文档
+    if department == "ADMIN":
+        data = collection.get(where={"status": "active"})
+    else:
+        data = collection.get(
+            where={
 
-            "$and":[
+                "$and":[
 
-                {
-                    "department": department
-                },
+                    {
+                        "department": department
+                    },
 
-                {
-                    "status": "active"
-                }
+                    {
+                        "status": "active"
+                    }
 
-            ]
+                ]
 
-        }
+            }
 
-    )
+        )
 
 
 
-    documents_cache[department] = data["documents"]
+    documents_cache[department] = data.get("documents") or []
 
-    metadatas_cache[department] = data["metadatas"]
+    metadatas_cache[department] = data.get("metadatas") or []
 
+
+
+    docs = documents_cache[department]
+
+    if not docs:
+        # 该部门无文档: 标记 None, 搜索时直接返回空 (避免 BM25Okapi 空语料抛异常)
+        bm25_cache[department] = None
+        return
 
 
     tokenized_docs = [
 
         tokenize(doc)
 
-        for doc in documents_cache[department]
+        for doc in docs
 
     ]
 
@@ -94,6 +106,9 @@ def bm25_search(
 
 
     bm25 = bm25_cache[department]
+
+    if bm25 is None:
+        return []  # 该部门无文档
 
     documents = documents_cache[department]
 

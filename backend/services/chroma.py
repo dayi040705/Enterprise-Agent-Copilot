@@ -1,11 +1,16 @@
 import chromadb
 import uuid
+from pathlib import Path
 
 from services.embedding import embedding_texts
 
 
+# 锚定 backend/chroma_db 绝对路径: 与启动目录无关, 避免数据分裂到其他位置
+BACKEND_DIR = Path(__file__).resolve().parents[1]
+CHROMA_PATH = str(BACKEND_DIR / "chroma_db")
+
 client = chromadb.PersistentClient(
-    path="./chroma_db"
+    path=CHROMA_PATH
 )
 
 

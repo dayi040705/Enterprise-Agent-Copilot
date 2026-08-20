@@ -40,6 +40,11 @@
           <el-button type="success" size="small" @click="sendDailyBriefing" :disabled="sending" style="margin-right:4px">
             晨报
           </el-button>
+          <el-select v-model="diagSku" size="small" placeholder="选择SKU" filterable clearable
+                     style="width:185px;margin-right:4px" :disabled="sending">
+            <el-option v-for="s in sampleSkus" :key="s.sku" :value="s.sku"
+                       :label="`${s.sku.slice(0, 8)}... | 售${s.sold} | 退款${s.refund_rate}%`" />
+          </el-select>
           <el-button type="warning" size="small" @click="sendListingDiagnosis" :disabled="sending" style="margin-right:8px">
             Listing诊断
           </el-button>
@@ -63,11 +68,16 @@
 
         <div v-for="(msg, i) in messages" :key="i"
              :class="['msg-bubble', msg.role==='user' ? 'msg-user' : 'msg-assistant']">
-          <div class="msg-role">{{ msg.role === 'user' ? username : (chatMode === 'rag' ? 'AI 助手' : chatMode === 'agent' ? 'Agent' : 'Planner') }}</div>
+          <div class="msg-role">{{ msg.role === 'user' ? username : (chatMode === 'rag' ? 'AI 助手' : chatMode === 'agent' ? 'Agent' : chatMode === 'planner' ? 'Planner' : chatMode === 'multi' ? 'Multi-Agent' : 'Agent 助手') }}</div>
           <!-- Planner 计划 -->
           <div v-if="msg.plan?.length" class="plan-box">
             <div class="plan-title">执行计划</div>
             <div v-for="(s, j) in msg.plan" :key="j" class="plan-step">{{ j+1 }}. {{ s }}</div>
+          </div>
+          <!-- Agent 实时进度日志 -->
+          <div v-if="msg.progress?.length" class="progress-box"
+               style="margin:8px 0;background:#1c2b3a;border-radius:8px;padding:8px 12px;font-size:12px;color:#8ab4c8;max-height:160px;overflow-y:auto">
+            <div v-for="(s, j) in msg.progress" :key="j" style="margin:2px 0">▸ {{ s }}</div>
           </div>
           <!-- Agent 工具调用卡片 — 可折叠 -->
           <div v-if="msg.toolCalls?.length" class="tool-calls" style="margin:8px 0">
@@ -112,11 +122,11 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted, nextTick } from 'vue'
+import { ref, reactive, onMounted, onActivated, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Promotion, Upload, ChatDotRound } from '@element-plus/icons-vue'
-import { getHistory, createSession, chatStream, agentStream, plannerStream, multiAgentStream, unifiedStream, dailyBriefing, listingDiagnosis, uploadFile } from '../api'
+import { getHistory, createSession, chatStream, agentStream, plannerStream, multiAgentStream, unifiedStream, dailyBriefing, listingDiagnosis, getSampleSkus, uploadFile } from '../api'
 
 const router = useRouter()
 const username = ref(localStorage.getItem('username') || '用户')
@@ -130,12 +140,36 @@ const historyList = ref([])
 const messages = ref([])
 const msgContainer = ref(null)
 const uploadRef = ref(null)
+const diagSku = ref('')        // Listing 诊断选中的 SKU
+const sampleSkus = ref([])     // 数据库中的真实 SKU 列表
 
 onMounted(async () => {
   if (!localStorage.getItem('token')) { router.push('/'); return }
   await loadHistory()
   await newSession()
+  loadSampleSkus()
 })
+
+onActivated(async () => {
+  // 从 Trace 等页面返回时 (keep-alive 恢复), 校验 token 仍有效
+  if (!localStorage.getItem('token')) { router.push('/'); return }
+  // 换账号重新登录 → 完整初始化, 不复用上一个用户的缓存状态
+  if (localStorage.getItem('__relogin') === '1') {
+    localStorage.removeItem('__relogin')
+    username.value = localStorage.getItem('username') || '用户'
+    isAdmin.value = localStorage.getItem('username') === 'admin'
+    await loadHistory()
+    await newSession()
+    loadSampleSkus()
+  }
+})
+
+async function loadSampleSkus() {
+  try {
+    const { data } = await getSampleSkus()
+    sampleSkus.value = Array.isArray(data) ? data : []
+  } catch (e) { /* 忽略, 用户可手动输入 */ }
+}
 
 async function loadHistory() {
   try {
@@ -240,7 +274,10 @@ async function sendRagMessage(q) {
       }
     }
   } catch (e) {
-    assistantMsg.content = '请求失败: ' + e.message
+    // 保留已输出的内容, 追加中断提示 (流中断时不要把半段答案抹掉)
+    assistantMsg.content = assistantMsg.content
+      ? assistantMsg.content + '\n\n[⚠️ 流式响应中断, 请重试]'
+      : '请求失败: ' + e.message
   }
 }
 
@@ -291,7 +328,10 @@ async function sendAgentMessage(q) {
       }
     }
   } catch (e) {
-    assistantMsg.content = '请求失败: ' + e.message
+    // 保留已输出的内容, 追加中断提示 (流中断时不要把半段答案抹掉)
+    assistantMsg.content = assistantMsg.content
+      ? assistantMsg.content + '\n\n[⚠️ 流式响应中断, 请重试]'
+      : '请求失败: ' + e.message
   }
 }
 
@@ -342,13 +382,16 @@ async function sendPlannerMessage(q) {
       }
     }
   } catch (e) {
-    assistantMsg.content = '请求失败: ' + e.message
+    // 保留已输出的内容, 追加中断提示 (流中断时不要把半段答案抹掉)
+    assistantMsg.content = assistantMsg.content
+      ? assistantMsg.content + '\n\n[⚠️ 流式响应中断, 请重试]'
+      : '请求失败: ' + e.message
   }
 }
 
 async function sendDailyBriefing() {
   sending.value = true
-  const assistantMsg = reactive({ role: 'assistant', content: '', toolCalls: [], plan: [], sessionId: '' })
+  const assistantMsg = reactive({ role: 'assistant', content: '', toolCalls: [], plan: [], progress: [], sessionId: '' })
   messages.value.push(assistantMsg)
   try {
     const resp = await dailyBriefing(localStorage.getItem('token'))
@@ -366,7 +409,7 @@ async function sendDailyBriefing() {
         if (!dataLine) continue
         try {
           const event = JSON.parse(dataLine)
-          if (event.type === 'status') assistantMsg.content += '[' + event.data + ']\n'
+          if (event.type === 'status') assistantMsg.progress.push(event.data)
           else if (event.type === 'plan') assistantMsg.plan = event.data || []
           else if (event.type === 'tool_call' || event.type === 'tool_start') assistantMsg.toolCalls.push({ tool: event.tool, args: event.args, result: '...' })
           else if (event.type === 'token') { assistantMsg.content += event.data; await nextTick(); scrollBottom() }
@@ -375,15 +418,32 @@ async function sendDailyBriefing() {
         } catch (e) {}
       }
     }
-  } catch (e) { assistantMsg.content = '日报请求失败: ' + e.message }
+  } catch (e) {
+    assistantMsg.content = assistantMsg.content
+      ? assistantMsg.content + '\n\n[⚠️ 流式响应中断, 请重试]'
+      : '日报请求失败: ' + e.message
+  }
   sending.value = false
 }
 
 async function sendListingDiagnosis() {
-  const sku = question.value.trim() || '51a41e5b'
+  // 优先级: 输入框内容 > 下拉选择的 SKU > 弹窗手动输入
+  let sku = (question.value.trim() || diagSku.value).trim()
+  if (!sku) {
+    try {
+      const { value } = await ElMessageBox.prompt('请输入要诊断的 SKU', 'Listing 诊断', {
+        confirmButtonText: '开始诊断', cancelButtonText: '取消',
+        inputPlaceholder: '例如: 51a41e5b',
+      })
+      sku = (value || '').trim()
+    } catch (e) {
+      return  // 用户取消
+    }
+  }
+  if (!sku) return
   if (sku === question.value.trim()) question.value = ''
   sending.value = true
-  const assistantMsg = reactive({ role: 'assistant', content: '', toolCalls: [], plan: [], sessionId: '' })
+  const assistantMsg = reactive({ role: 'assistant', content: '', toolCalls: [], plan: [], progress: [], sessionId: '' })
   messages.value.push({ role: 'user', content: '诊断 SKU: ' + sku })
   messages.value.push(assistantMsg)
   try {
@@ -402,7 +462,7 @@ async function sendListingDiagnosis() {
         if (!dataLine) continue
         try {
           const event = JSON.parse(dataLine)
-          if (event.type === 'status') assistantMsg.content += '[' + event.data + ']\n'
+          if (event.type === 'status') assistantMsg.progress.push(event.data)
           else if (event.type === 'plan') assistantMsg.plan = event.data || []
           else if (event.type === 'tool_call' || event.type === 'tool_start') assistantMsg.toolCalls.push({ tool: event.tool, args: event.args, result: '...' })
           else if (event.type === 'token') { assistantMsg.content += event.data; await nextTick(); scrollBottom() }
@@ -411,13 +471,17 @@ async function sendListingDiagnosis() {
         } catch (e) {}
       }
     }
-  } catch (e) { assistantMsg.content = '诊断请求失败: ' + e.message }
+  } catch (e) {
+    assistantMsg.content = assistantMsg.content
+      ? assistantMsg.content + '\n\n[⚠️ 流式响应中断, 请重试]'
+      : '诊断请求失败: ' + e.message
+  }
   sending.value = false
 }
 
 async function sendUnifiedMessage(q) {
   sending.value = true
-  const assistantMsg = reactive({ role: 'assistant', content: '', sources: [], toolCalls: [], plan: [], sessionId: '' })
+  const assistantMsg = reactive({ role: 'assistant', content: '', sources: [], toolCalls: [], plan: [], progress: [], sessionId: '' })
   messages.value.push(assistantMsg)
 
   try {
@@ -439,21 +503,19 @@ async function sendUnifiedMessage(q) {
         try {
           const event = JSON.parse(dataLine)
           if (event.type === 'route') {
-            assistantMsg.content = 'Router: ' + event.mode + ' 模式\n\n'
+            assistantMsg.progress.push('Router → ' + event.mode + ' 模式')
           } else if (event.type === 'plan') {
             assistantMsg.plan = event.data || []
-            assistantMsg.content += 'Supervisor 拆解任务:\n' + event.data.map((s, i) => '  ' + (i+1) + '. ' + s).join('\n')
           } else if (event.type === 'tool_call' || event.type === 'tool_start') {
             assistantMsg.toolCalls.push({ tool: event.tool, args: event.args, result: '执行中...' })
           } else if (event.type === 'tool_result') {
             const last = assistantMsg.toolCalls[assistantMsg.toolCalls.length - 1]
             if (last) last.result = (event.data || '').slice(0, 120)
           } else if (event.type === 'token') {
-            if (assistantMsg.content && assistantMsg.content.startsWith('Router:')) assistantMsg.content = ''
             assistantMsg.content += event.data
             await nextTick(); scrollBottom()
           } else if (event.type === 'status') {
-            assistantMsg.content += '\n[' + event.data + ']'
+            assistantMsg.progress.push(event.data)
           } else if (event.type === 'done') {
             assistantMsg.content = event.answer || assistantMsg.content
             assistantMsg.sessionId = event.session_id || ''
@@ -464,14 +526,17 @@ async function sendUnifiedMessage(q) {
       }
     }
   } catch (e) {
-    assistantMsg.content = '请求失败: ' + e.message
+    // 保留已输出的内容, 追加中断提示 (流中断时不要把半段答案抹掉)
+    assistantMsg.content = assistantMsg.content
+      ? assistantMsg.content + '\n\n[⚠️ 流式响应中断, 请重试]'
+      : '请求失败: ' + e.message
   }
   sending.value = false
 }
 
 async function sendMultiAgentMessage(q) {
   sending.value = true
-  const assistantMsg = reactive({ role: 'assistant', content: '', sources: [], toolCalls: [], plan: [], sessionId: '' })
+  const assistantMsg = reactive({ role: 'assistant', content: '', sources: [], toolCalls: [], plan: [], progress: [], sessionId: '' })
   messages.value.push(assistantMsg)
 
   try {
@@ -494,17 +559,13 @@ async function sendMultiAgentMessage(q) {
           const event = JSON.parse(dataLine)
           if (event.type === 'plan') {
             assistantMsg.plan = event.data || []
-            assistantMsg.content = 'Multi-Agent 协作:\n' + event.data.map((s, i) => `  ${i+1}. ${s}`).join('\n')
           } else if (event.type === 'token') {
             // 流式逐 token 显示 Reporter 生成的报告
-            if (assistantMsg.content && assistantMsg.content.startsWith('Supervisor')) {
-              assistantMsg.content = ''  // 清掉计划文字, 开始流式报告
-            }
             assistantMsg.content += event.data
             await nextTick()
             scrollBottom()
           } else if (event.type === 'status') {
-            assistantMsg.content += '\n[' + event.data + ']'
+            assistantMsg.progress.push(event.data)
           } else if (event.type === 'done') {
             assistantMsg.content = event.answer || assistantMsg.content
             assistantMsg.sessionId = event.session_id || ''
@@ -523,7 +584,10 @@ async function sendMultiAgentMessage(q) {
       }
     }
   } catch (e) {
-    assistantMsg.content = '请求失败: ' + e.message
+    // 保留已输出的内容, 追加中断提示 (流中断时不要把半段答案抹掉)
+    assistantMsg.content = assistantMsg.content
+      ? assistantMsg.content + '\n\n[⚠️ 流式响应中断, 请重试]'
+      : '请求失败: ' + e.message
   }
 }
 
@@ -545,7 +609,12 @@ async function handleUpload(e) {
 }
 
 function logout() {
+  // 清空会话状态, 防止下一个登录用户看到上一个用户的对话 (keep-alive 缓存)
+  messages.value = []
+  conversationId.value = ''
+  historyList.value = []
   localStorage.clear()
+  localStorage.setItem('__relogin', '1')  // 标记: 下次进入 Chat 需完整重新初始化
   router.push('/')
 }
 </script>

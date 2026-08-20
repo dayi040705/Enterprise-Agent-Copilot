@@ -105,6 +105,7 @@ export function listingDiagnosis(sku, token) {
     body: JSON.stringify({ question: sku, conversation_id: 'listing-diag' })
   })
 }
+export const getSampleSkus = () => api.get('/chat/sample-skus')
 export const getHistory = () => api.get('/chat/history')
 
 // ========== 文档管理 ==========

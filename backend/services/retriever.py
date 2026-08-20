@@ -14,17 +14,24 @@ def vector_search(
         [question]
     )[0]
 
-    # 2. 向量检索 + 部门/状态过滤
-    result = collection.query(
-        query_embeddings=[vector],
-        n_results=top_k,
-        where={
-            "$and": [
-                {"department": department},
-                {"status": "active"}
-            ]
-        }
-    )
+    # 2. 向量检索 + 部门/状态过滤 (ADMIN 不受部门限制)
+    if department == "ADMIN":
+        result = collection.query(
+            query_embeddings=[vector],
+            n_results=top_k,
+            where={"status": "active"}
+        )
+    else:
+        result = collection.query(
+            query_embeddings=[vector],
+            n_results=top_k,
+            where={
+                "$and": [
+                    {"department": department},
+                    {"status": "active"}
+                ]
+            }
+        )
 
     documents = result["documents"][0]
     metadatas = result["metadatas"][0]

@@ -21,7 +21,8 @@ from config import DEEPSEEK_API_KEY, DEEPSEEK_MODEL
 from services.agent import TOOLS
 from services.executor import execute as exec_tool
 
-client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
+client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com",
+                     timeout=120, max_retries=2)
 
 
 # ── State 定义 ──
@@ -239,6 +240,7 @@ async def run_agent_stream_tokens(user_message: str, department: str = "HR",
     seen_calls: set[str] = set()
     full_answer = ""
     analyzer_rounds = 0
+    start_len = len(msgs)  # 本轮新增消息的起点 (会话状态只追加新消息)
 
     for _ in range(max_calls):
         # 条件4: 达到上限 → 强制输出
@@ -256,30 +258,44 @@ async def run_agent_stream_tokens(user_message: str, department: str = "HR",
             full_answer = "[连续无新信息] " + full_answer
             break
 
-        stream = await client.chat.completions.create(
-            model=DEEPSEEK_MODEL, messages=msgs, tools=TOOLS,
-            temperature=0, stream=True,
-            stream_options={"include_usage": True},
-        )
+        try:
+            stream = await client.chat.completions.create(
+                model=DEEPSEEK_MODEL, messages=msgs, tools=TOOLS,
+                temperature=0, stream=True,
+                stream_options={"include_usage": True},
+            )
+        except Exception as e:
+            # 建连失败 (网络/限流/API异常) — 推状态后优雅收尾, 不炸断 SSE
+            yield json.dumps({"type": "status",
+                "data": f"LLM 调用失败 ({type(e).__name__}), 结束本轮"}, ensure_ascii=False)
+            break
 
         content = ""
         tool_calls_acc: dict[int, dict] = {}
 
-        async for chunk in stream:
-            delta = chunk.choices[0].delta if chunk.choices else None
-            if not delta: continue
-            if delta.content:
-                content += delta.content
-                yield json.dumps({"type": "token", "data": delta.content}, ensure_ascii=False)
-            if delta.tool_calls:
-                for tc in delta.tool_calls:
-                    idx = tc.index
-                    if idx not in tool_calls_acc:
-                        tool_calls_acc[idx] = {"id": tc.id or "", "function": {"name": "", "arguments": ""}}
-                    if tc.id: tool_calls_acc[idx]["id"] = tc.id
-                    if tc.function:
-                        if tc.function.name: tool_calls_acc[idx]["function"]["name"] += tc.function.name
-                        if tc.function.arguments: tool_calls_acc[idx]["function"]["arguments"] += tc.function.arguments
+        try:
+            async for chunk in stream:
+                delta = chunk.choices[0].delta if chunk.choices else None
+                if not delta: continue
+                if delta.content:
+                    content += delta.content
+                    yield json.dumps({"type": "token", "data": delta.content}, ensure_ascii=False)
+                if delta.tool_calls:
+                    for tc in delta.tool_calls:
+                        idx = tc.index
+                        if idx not in tool_calls_acc:
+                            tool_calls_acc[idx] = {"id": tc.id or "", "function": {"name": "", "arguments": ""}}
+                        if tc.id: tool_calls_acc[idx]["id"] = tc.id
+                        if tc.function:
+                            if tc.function.name: tool_calls_acc[idx]["function"]["name"] += tc.function.name
+                            if tc.function.arguments: tool_calls_acc[idx]["function"]["arguments"] += tc.function.arguments
+        except Exception as e:
+            # 流中途断开 (API 抖动/连接重置) — 保留已生成部分, 优雅收尾
+            yield json.dumps({"type": "status",
+                "data": f"流式输出中断 ({type(e).__name__}), 返回已生成部分"}, ensure_ascii=False)
+            if content:
+                full_answer = content
+            break
 
         if tool_calls_acc:
             tool_list = []
@@ -350,9 +366,13 @@ async def run_agent_stream_tokens(user_message: str, department: str = "HR",
                        "明确说明缺失什么信息。")
 
     msgs.append({"role": "assistant", "content": full_answer})
-    await agent_graph.aupdate_state(config, {"messages": msgs, "final_answer": full_answer,
-                                             "total_calls": calls, "empty_streak": streak,
-                                             "department": department})
+    # 会话状态持久化: 只追加本轮新增消息, 并显式指定 as_node 避免
+    # "Ambiguous update" (messages 被多个节点输出时 LangGraph 无法自动推断归属)
+    new_msgs = msgs[start_len:]
+    try:
+        await agent_graph.aupdate_state(config, {"messages": new_msgs}, as_node="call_llm")
+    except Exception:
+        pass  # 状态保存失败不影响回答返回 (历史丢失好过整条 SSE 崩溃)
 
     yield json.dumps({"type": "done", "answer": full_answer,
                       "conversation_id": cid}, ensure_ascii=False)

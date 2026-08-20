@@ -15,7 +15,8 @@ from services.agent import agent_chat_stream
 from services.multi_agent import multi_agent_chat
 from services.multi_agent import _route_intent
 
-judge_client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
+judge_client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com",
+                           timeout=120, max_retries=2)
 
 # DeepSeek V4 定价 (每百万 token)
 PRICE_INPUT = 0.28   # $0.28 / 1M input tokens

@@ -8,6 +8,7 @@ Multi-Agent v2 — 并行执行 + 共享状态 + 智能Reviewer + 可追踪
   4. 执行树 trace 可视化
 """
 import json, asyncio, hashlib
+from datetime import datetime
 from dataclasses import dataclass, field, asdict
 from typing import TypedDict, AsyncGenerator, Optional
 from pydantic import BaseModel, Field
@@ -18,7 +19,8 @@ from services.executor import MCPOrdersParams, QueryAnalyticsParamsV2, QueryList
 from services.chroma import client as chroma_client
 from services.embedding import embedding_texts
 
-client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
+client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com",
+                     timeout=120, max_retries=2)
 TOOL_TIMEOUT = 15  # 单个工具最多跑 15 秒
 
 
@@ -262,25 +264,46 @@ def _extract_service(task: str) -> str:
 
 # ── 并行执行 ──
 
-async def _call_specialist(agent_type: str, task: str, dept: str, max_calls: int = 3) -> tuple[list[dict], list]:
+async def _call_specialist(agent_type: str, task: str, dept: str, max_calls: int = 3,
+                           progress_cb=None) -> tuple[list[dict], list]:
     """调一个专业 Agent, 返回 (evidence_items, trace).
-       evidence_items: [{"source": "search_logs", "content": "..."}, ...]"""
+       evidence_items: [{"source": "search_logs", "content": "..."}, ...]
+       progress_cb: 可选, 每次工具调用前推送进度消息 (如 "Action Agent → query_analytics")"""
     agent = AGENTS[agent_type]
     msgs = [
         {"role": "system", "content": f"{agent['system']} 部门: {dept}。"},
         {"role": "user", "content": f"任务: {task}\n用工具获取数据后简洁输出。"},
     ]
     evidence_items, trace = [], []
+    seen_calls: set[str] = set()  # 去重: 相同工具+参数只执行一次
 
     for _ in range(max_calls):
-        resp = await client.chat.completions.create(
-            model=DEEPSEEK_MODEL, messages=msgs, tools=agent["tools"], temperature=0)
+        try:
+            resp = await client.chat.completions.create(
+                model=DEEPSEEK_MODEL, messages=msgs, tools=agent["tools"], temperature=0)
+        except Exception as e:
+            # LLM 调用失败: 带着已收集的证据返回, 不让整个并行任务崩溃
+            evidence_items.append(Evidence(
+                agent=agent_type, tool="llm_error",
+                content=f"LLM 调用失败 ({type(e).__name__}), 已返回之前收集的证据", source="llm_error"))
+            break
         ch = resp.choices[0]
 
         if ch.message.tool_calls:
             for tc in ch.message.tool_calls:
                 try: args = json.loads(tc.function.arguments)
                 except json.JSONDecodeError: continue
+                call_key = f"{tc.function.name}:{json.dumps(args, sort_keys=True, ensure_ascii=False)}"
+                if call_key in seen_calls:
+                    r = "[跳过] 相同工具+参数已调用过, 结果同上。"
+                    msgs.append({"role": "assistant", "content": None,
+                                 "tool_calls": [{"id": tc.id, "type": "function",
+                                   "function": {"name": tc.function.name, "arguments": tc.function.arguments}}]})
+                    msgs.append({"role": "tool", "tool_call_id": tc.id, "content": r})
+                    continue
+                seen_calls.add(call_key)
+                if progress_cb:
+                    progress_cb(f"{agent['name']} → 调用 {tc.function.name}")
                 if tc.function.name in ("search_incidents", "search_memory"):
                     raw_q = args.get("query", "")
                     svc = _extract_service(task)
@@ -297,7 +320,8 @@ async def _call_specialist(agent_type: str, task: str, dept: str, max_calls: int
                 evidence_items.append(Evidence(
                     agent=agent_type, tool=tc.function.name,
                     content=r[:500], source=tc.function.name))
-                trace.append({"tool": tc.function.name, "args": args, "result": r[:120]})
+                trace.append({"tool": tc.function.name, "args": args, "result": r[:120],
+                              "time": datetime.now().strftime("%H:%M:%S")})
                 am = {"role": "assistant", "content": None,
                       "tool_calls": [{"id": tc.id, "type": "function",
                         "function": {"name": tc.function.name, "arguments": tc.function.arguments}}]}
@@ -314,15 +338,18 @@ async def _call_specialist(agent_type: str, task: str, dept: str, max_calls: int
     return evidence_items, trace
 
 
-async def _execute_parallel(state: SharedState, yield_cb=None) -> dict:
-    """并行执行, 逐个完成即推状态 (非全部等完)"""
-    tasks = state["tasks"]
+async def _execute_parallel(state: SharedState, yield_cb=None, tasks: list | None = None) -> dict:
+    """并行执行, 逐个完成即推状态 (非全部等完)
+
+    tasks: 指定要执行的任务子集 (补查时只跑新任务, 不重复跑已完成的旧任务)
+    """
+    tasks = tasks if tasks is not None else state["tasks"]
     dept = state["department"]
 
     async def run_one(item):
         agent_type = item["agent"]
         task = item["task"]
-        evidence_items, trace = await _call_specialist(agent_type, task, dept)
+        evidence_items, trace = await _call_specialist(agent_type, task, dept, progress_cb=yield_cb)
         return agent_type, evidence_items, trace
 
     # as_completed: 谁先完成就先推状态
@@ -338,6 +365,7 @@ async def _execute_parallel(state: SharedState, yield_cb=None) -> dict:
         trace_nodes.append({
             "agent": agent_type, "name": AGENTS[agent_type]["name"],
             "items": len(evidence_items), "children": trace,
+            "finished": datetime.now().strftime("%H:%M:%S"),
         })
         # 逐个推状态
         if yield_cb:
@@ -346,6 +374,22 @@ async def _execute_parallel(state: SharedState, yield_cb=None) -> dict:
     state["evidence"] = evidence
     state["trace_tree"].append({"phase": "execute", "nodes": trace_nodes})
     return evidence
+
+
+async def _execute_parallel_stream(state: SharedState, tasks: list | None = None):
+    """执行并行 Agent, 并把每个 Agent 的进度实时推送 (供 SSE 逐条展示)
+
+    tasks: 指定要执行的任务子集 (补查时只跑新任务)
+    """
+    status_queue = asyncio.Queue()
+    exec_task = asyncio.create_task(_execute_parallel(state, yield_cb=status_queue.put_nowait, tasks=tasks))
+    while not exec_task.done():
+        try:
+            msg = status_queue.get_nowait()
+            yield json.dumps({"type": "status", "data": msg}, ensure_ascii=False)
+        except asyncio.QueueEmpty:
+            await asyncio.sleep(0.3)
+    await exec_task  # 若执行中抛异常, 在此传播
 
 
 # ── Supervisor ──
@@ -521,8 +565,16 @@ async def _reviewer_v2(state: SharedState) -> dict:
 - consistency: 证据之间有矛盾时, 报告是否标注了 ⚠️ 冲突而不是隐瞒或选边站?
 - passed: faith>=0.5 AND relev>=0.6 (有证据支撑+切题就过)
 
+## 通过标准 (从宽):
+- 报告基于已收集证据、直接回答了用户问题 → passed=true
+- "待确认"章节列出的项是报告质量的一部分 (后续可深入排查的方向), 不代表本次不合格
+- 只有两种情况才判 passed=false:
+  ① 用户的核心问题完全没有被回答
+  ② 报告编造了证据中不存在的数据
+- 证据本身就查不到的数据 (如具体数值), 报告如实说明即可, 不算缺失
+
 ## 如果未通过:
-- missing_evidence: 缺失哪些信息 (只描述缺什么)
+- missing_evidence: 缺失哪些信息 (只描述缺什么, 最多 2 条)
 - inconsistency: 如果报告在证据矛盾时选边站了, 指出具体矛盾
 
 输出 JSON:
@@ -545,6 +597,22 @@ async def _reviewer_v2(state: SharedState) -> dict:
 
 # ── 主入口: 完整闭环 ──
 
+import re as _re
+
+# 确定性预路由: 纯知识/SOP 咨询不依赖 LLM 判断, 直接走 knowledge (快且稳)
+_KNOWLEDGE_PATTERN = _re.compile(
+    r'怎么办|怎么应对|如何应对|如何处理|怎么处理|如何解决|流程是什么|什么流程|操作规范|有什么规范|SOP'
+    r'|如何识别|怎么识别|如何判断|怎么判断|如何预防|怎么预防|如何操作|怎么操作|如何做|怎么做')
+_DATA_PATTERN = _re.compile(r'退款率|销量|销售额|SKU|订单|趋势|排名|评分|库存|暴涨|暴跌|飙升|下降了|查一下|查查|排查|诊断')
+
+
+def _pre_route(question: str) -> tuple[str, str] | None:
+    """问处理流程/应对方法且不涉及业务数据 → 直接路由 knowledge, 省一次 LLM 调用"""
+    if _KNOWLEDGE_PATTERN.search(question) and not _DATA_PATTERN.search(question):
+        return ("simple", "knowledge")
+    return None
+
+
 async def _route_intent(question: str) -> tuple[str, str]:
     """三路 Router: 返回 (route, agent_type)
 
@@ -553,31 +621,37 @@ async def _route_intent(question: str) -> tuple[str, str]:
     action:     查具体数据 → Action Agent (query_mysql / query_analytics)
     complex:    多源交叉+诊断报告 → 完整 Multi-Agent
     """
+    pre = _pre_route(question)
+    if pre:
+        return pre
+
     prompt = f"""你是电商运营系统的路由专家。分析用户意图，只回答一个词。
 
 判断标准(优先级从高到低):
 
-1. action — 单一数据查询，满足任意一条:
+1. knowledge — 询问处理流程/SOP/应对方法/操作规范 (纯知识咨询):
+   - "退货怎么处理"、"广告怎么投放"、"跟卖怎么办"、"XX怎么应对"
+   - "XX的流程是什么"、"有什么规范"、"如何识别/怎么判断/如何预防"
+   - 只要不需要查业务数据库的流程/方法类问题, 一律走 knowledge
+   - 追问类问题(如何识别/怎么判断/具体怎么做)默认 knowledge, 除非用户明确要求查数据
+
+2. action — 单一数据查询，满足任意一条:
    - "退款率最高的是哪个"、"哪个SKU卖得最好"、"最近订单"
    - "查一下XX数据"、"XX有多少"、"XX是什么"
-   - 只需要查一张表或一个数据源的简单查询
-
-2. knowledge — 只问流程/SOP/策略:
-   - "退货怎么处理"、"广告怎么投放"、"跟卖怎么办"
-   - "XX的流程是什么"、"有什么规范"
 
 3. diagnostic — 查数据异常/趋势:
    - 单维度对比: "过去7天销量趋势"、"退款率变化"
    - "有没有异常波动"、"为什么XX下降了"
 
-4. complex — 多源交叉诊断，满足任意一条:
-   - 涉及 2 个及以上数据源(数据库+知识库+历史经验)
-   - 提到"全面排查"、"诊断报告"、"根因分析"
-   - 需要对比多个维度才能得出结论(如"转化率暴跌,排查评分+广告+跟卖")
+4. complex — 多源交叉诊断，必须满足:
+   - 提到"全面排查"、"诊断报告"、"根因分析" 等明确排障意图
+   - 且需要对比 2 个及以上数据源(数据库+知识库+历史经验)
+   - 纯 SOP 咨询(怎么办/如何应对)即使提到跟卖、广告等术语也不算 complex
 
 规则:
 - "查退款率最高" → action (单次查询,不是排障)
 - "退货流程" → knowledge (SOP)
+- "如果有人跟卖, 我该怎么应对" → knowledge (纯咨询, 不用查数据)
 - "转化率暴跌,全面排查" → complex (需要跨数据源对比)
 - "查XX然后分析" → action (数据查询+简单解释)
 
@@ -597,9 +671,26 @@ async def _route_intent(question: str) -> tuple[str, str]:
 
 
 async def multi_agent_chat(question: str, department: str = "TECH",
-                           max_iterations: int = 2) -> AsyncGenerator[dict, None]:
-    """Router → Simple Agent or Full Multi-Agent"""
-    route, agent_type = await _route_intent(question)
+                           max_iterations: int = 2,
+                           pre_route: tuple[str, str] | None = None) -> AsyncGenerator[dict, None]:
+    """Router → Simple Agent or Full Multi-Agent
+
+    pre_route: 调用方(如 Unified 入口)已判定的 (route, agent_type),
+               传入后跳过内部 Router, 避免重复 LLM 调用和结果不一致。
+    """
+    start_ts = datetime.now().strftime("%H:%M:%S")
+    if pre_route:
+        route, agent_type = pre_route
+        yield json.dumps({"type": "status",
+            "data": f"Router → {'Multi-Agent 复杂排障' if route == 'complex' else AGENTS[agent_type]['name']}"},
+            ensure_ascii=False)
+    else:
+        # 立即推一条状态, 避免用户面对长时间空白
+        yield json.dumps({"type": "status", "data": "Router: 分析问题类型中..."}, ensure_ascii=False)
+        route, agent_type = await _route_intent(question)
+        yield json.dumps({"type": "status",
+            "data": f"Router → {'Multi-Agent 复杂排障' if route == 'complex' else AGENTS[agent_type]['name']}"},
+            ensure_ascii=False)
 
     # 简单路由: 单Agent 直接回答
     if route == "simple":
@@ -607,7 +698,7 @@ async def multi_agent_chat(question: str, department: str = "TECH",
         yield json.dumps({"type": "status", "data": f"Router→{agent_name}"}, ensure_ascii=False)
 
         # 如果是 knowledge, 额外做一个简短回答
-        evidence_items, _ = await _call_specialist(agent_type, question, department)
+        evidence_items, agent_trace = await _call_specialist(agent_type, question, department)
         results = [e.summary() for e in evidence_items]
 
         if results:
@@ -622,17 +713,18 @@ async def multi_agent_chat(question: str, department: str = "TECH",
         else:
             answer = "未找到相关信息"
 
-        # Trace
-        from datetime import datetime as _dt
-        ts = _dt.now().strftime("%H:%M:%S"); cid = hashlib.md5(question.encode()).hexdigest()[:12]
-        root = TraceNode(id="root", type="user", name=question[:60], input=question, timestamp=ts)
+        # Trace (每个节点用真实执行时间)
+        cid = hashlib.md5(question.encode()).hexdigest()[:12]
+        root = TraceNode(id="root", type="user", name=question[:60], input=question, timestamp=start_ts)
         router = TraceNode(id="router", type="supervisor", name=f"Router → {agent_name}",
-                           parent_id="root", timestamp=ts)
+                           parent_id="root", timestamp=start_ts)
+        agent_ts = agent_trace[-1].get("time", start_ts) if agent_trace else start_ts
         agent = TraceNode(id=f"agent_{agent_type}", type="agent", name=agent_name,
-                          parent_id="router", timestamp=ts)
+                          parent_id="router", timestamp=agent_ts)
         for i, ev in enumerate(evidence_items):
+            t_ts = agent_trace[i].get("time", agent_ts) if i < len(agent_trace) else agent_ts
             agent.children.append(TraceNode(id=f"tool_{i}", type="tool", name=ev.tool,
-                parent_id=f"agent_{agent_type}", output=ev.content[:200], timestamp=ts))
+                parent_id=f"agent_{agent_type}", output=ev.content[:200], timestamp=t_ts))
         router.children.append(agent); root.children.append(router)
         _trace_sessions[cid] = root
 
@@ -647,29 +739,42 @@ async def multi_agent_chat(question: str, department: str = "TECH",
     }
 
     # Phase 1: Supervisor
+    yield json.dumps({"type": "status", "data": "Supervisor: 拆解任务中..."}, ensure_ascii=False)
     state["tasks"] = await _supervisor_plan(question)
-    state["trace_tree"].append({"phase": "supervisor", "plan": state["tasks"]})
+    sup_ts = datetime.now().strftime("%H:%M:%S")
+    state["trace_tree"].append({"phase": "supervisor", "plan": state["tasks"], "time": sup_ts})
     yield json.dumps({"type": "plan", "data": [t["task"] for t in state["tasks"]]}, ensure_ascii=False)
 
-    # Phase 2: 并行执行 — 逐个完成就推状态
+    # Phase 2: 并行执行 — 逐个工具调用实时推状态
     yield json.dumps({"type": "status", "data": f"{len(state['tasks'])} 个 Agent 并行执行中..."}, ensure_ascii=False)
-    await _execute_parallel(state, yield_cb=lambda msg: None)  # 同步版本不推细节
+    async for ev in _execute_parallel_stream(state):
+        yield ev
     yield json.dumps({"type": "status", "data": f"全部完成, 收到证据: {list(state['evidence'].keys())}"}, ensure_ascii=False)
 
     # Phase 3-5: Reporter → Reviewer → 自动补查闭环
+    rep_ts = start_ts
+    rv_ts = start_ts
     for iteration in range(max_iterations):
         # Reporter (流式逐 token)
         yield json.dumps({"type": "status", "data": "Reporter: 生成报告..."}, ensure_ascii=False)
         report_text = ""
-        async for token in _reporter_stream(state):
-            report_text += token
-            yield json.dumps({"type": "token", "data": token}, ensure_ascii=False)
+        try:
+            async for token in _reporter_stream(state):
+                report_text += token
+                yield json.dumps({"type": "token", "data": token}, ensure_ascii=False)
+        except Exception as e:
+            # 流中途断开: 保留已生成部分, 不让 SSE 整体崩溃
+            yield json.dumps({"type": "status",
+                "data": f"Reporter 流式中断 ({type(e).__name__}), 使用已生成部分"}, ensure_ascii=False)
         state["report"] = report_text
+        rep_ts = datetime.now().strftime("%H:%M:%S")
 
-        # Reviewer
+        # Reviewer (先推状态再调, 避免用户对着静止画面等)
+        yield json.dumps({"type": "status", "data": "Reviewer: 审查报告中..."}, ensure_ascii=False)
         review = await _reviewer_v2(state)
         state["review"] = review
-        state["trace_tree"].append({"phase": "reviewer", "review": review})
+        rv_ts = datetime.now().strftime("%H:%M:%S")
+        state["trace_tree"].append({"phase": "reviewer", "review": review, "time": rv_ts})
 
         if review.get("passed", False):
             yield json.dumps({"type": "status", "data": f"Reviewer: 通过 (faith={review['faithfulness']:.0%})"}, ensure_ascii=False)
@@ -685,24 +790,26 @@ async def multi_agent_chat(question: str, department: str = "TECH",
             # Supervisor 根据缺失项规划补查任务
             replan = await _supervisor_replan(state["question"], missing)
             if replan:
+                replan = replan[:2]  # 最多补查 2 个任务, 控制总耗时
                 state["tasks"].extend(replan)
-                await _execute_parallel(state)
+                yield json.dumps({"type": "status",
+                    "data": f"Supervisor 规划了 {len(replan)} 个补查任务, 执行中..."}, ensure_ascii=False)
+                # 只执行新规划的补查任务, 不重复跑已完成的旧任务
+                async for ev in _execute_parallel_stream(state, tasks=replan):
+                    yield ev
                 yield json.dumps({"type": "status",
                     "data": f"补查完成, 新增证据: {list(state['evidence'].keys())}"}, ensure_ascii=False)
         else:
             yield json.dumps({"type": "status", "data": "达最大迭代, 输出当前版本"}, ensure_ascii=False)
             break
 
-    # ── 构建 TraceNode 树 ──
-    from datetime import datetime as _dt
-    ts = _dt.now().strftime("%H:%M:%S")
-
-    root = TraceNode(id="root", type="user", name=question[:60], input=question, timestamp=ts)
+    # ── 构建 TraceNode 树 (每个节点使用执行阶段的真实时间戳) ──
+    root = TraceNode(id="root", type="user", name=question[:60], input=question, timestamp=start_ts)
 
     # Supervisor
     sup = TraceNode(id="supervisor", type="supervisor", name="Supervisor",
                     parent_id="root", output=json.dumps(state["tasks"], ensure_ascii=False),
-                    timestamp=ts)
+                    timestamp=sup_ts)
     root.children.append(sup)
 
     # Execute phase: 从 trace_tree 取 tool args (不是从 evidence 取 content)
@@ -713,7 +820,8 @@ async def multi_agent_chat(question: str, department: str = "TECH",
                 agent_node = TraceNode(
                     id=f"agent_{agent_name}", type="agent",
                     name=AGENTS.get(agent_name, {}).get("name", agent_name),
-                    parent_id="supervisor", timestamp=ts)
+                    parent_id="supervisor",
+                    timestamp=tn.get("finished", sup_ts))
                 for child in tn.get("children", []):
                     tool_node = TraceNode(
                         id=f"tool_{agent_name}_{child['tool']}", type="tool",
@@ -721,14 +829,14 @@ async def multi_agent_chat(question: str, department: str = "TECH",
                         parent_id=f"agent_{agent_name}",
                         input=json.dumps(child.get("args", {}), ensure_ascii=False),
                         output=(child.get("result") or "")[:300],
-                        timestamp=ts)
+                        timestamp=child.get("time", tn.get("finished", sup_ts)))
                     agent_node.children.append(tool_node)
                 sup.children.append(agent_node)
             break
 
     # Reporter
     rep = TraceNode(id="reporter", type="reporter", name="Reporter",
-                    parent_id="supervisor", output=state["report"][:300], timestamp=ts)
+                    parent_id="supervisor", output=state["report"][:300], timestamp=rep_ts)
     sup.children.append(rep)
 
     # Reviewer
@@ -740,7 +848,7 @@ async def multi_agent_chat(question: str, department: str = "TECH",
                                        "passed": rv.get("passed"),
                                        "missing": rv.get("missing_evidence", [])[:3]},
                                       ensure_ascii=False),
-                    timestamp=ts)
+                    timestamp=rv_ts)
     rep.children.append(rev)
 
     # 保存到 session 存储
@@ -748,10 +856,10 @@ async def multi_agent_chat(question: str, department: str = "TECH",
     _trace_sessions[cid] = root
 
     # 自动存入故障记忆 (Reviewer 通过后才存)
+    # 后台线程执行: embedding 计算是 CPU 密集操作, 不能阻塞最终结果返回
     review = state.get("review", {})
     if review.get("passed"):
         try:
-            from datetime import datetime
             service = ""
             if "user-service" in question: service = "user-service"
             elif "payment-service" in question: service = "payment-service"
@@ -759,7 +867,7 @@ async def multi_agent_chat(question: str, department: str = "TECH",
             inc = Incident(service=service, problem=question[:200],
                            root_cause="", solution=state["report"][:500],
                            time=datetime.now().strftime("%Y-%m-%d %H:%M"), severity="P1")
-            save_incident(inc, department)
+            asyncio.create_task(asyncio.to_thread(save_incident, inc, department))
         except Exception: pass
 
     # 最终输出

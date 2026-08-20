@@ -4,7 +4,7 @@
       <h3>Agent Execution Trace</h3>
       <el-input v-model="sessionId" placeholder="Session ID" style="width:200px" size="small" />
       <el-button size="small" type="primary" @click="loadTrace">加载</el-button>
-      <el-button @click="$router.back()" style="margin-left:auto">返回聊天</el-button>
+      <el-button @click="$router.push('/chat')" style="margin-left:auto">返回聊天</el-button>
     </el-header>
 
     <el-main style="background:#f5f7fa;overflow:auto;padding:20px">
